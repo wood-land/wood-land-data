@@ -2,12 +2,14 @@ name: 주간 데이터 수집
 
 on:
   schedule:
-    # 매일 UTC 22시 = 한국시간(KST) 오전 7시. 필요하면 이 줄만 수정하세요.
-    - cron: "0 22 * * *"
+    # 금요일 오후 6시(KST) = 금요일 09:00 UTC → type_a 5시간 작업
+    - cron: "0 9 * * 5"
+    # 토요일 새벽 3시(KST) = 금요일 18:00 UTC → type_b 5시간 작업
+    - cron: "0 18 * * 5"
   workflow_dispatch:
     inputs:
       collect_mode:
-        description: "수집 범위"
+        description: "수집 범위 (수동 실행 시에만 선택 가능. 예약 실행은 자동으로 결정됨)"
         required: false
         default: "both"
         type: choice
@@ -23,7 +25,7 @@ on:
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    timeout-minutes: 340  # GitHub Actions 무료 한도(360분)에 여유를 둔 값
+    timeout-minutes: 300  # 5시간
 
     steps:
       - name: 저장소 코드 가져오기
@@ -40,6 +42,23 @@ jobs:
       - name: 브라우저 설치
         uses: browser-actions/setup-chrome@v1
 
+      - name: 수집 범위 결정
+        id: mode
+        run: |
+          # 수동 실행(workflow_dispatch)이면 사람이 고른 값을 그대로 쓴다.
+          # 예약 실행(schedule)이면 어느 cron이 트리거했는지로 자동 결정한다:
+          #   금요일 09:00 UTC(=한국시간 금 18시) 트리거 -> type_a
+          #   금요일 18:00 UTC(=한국시간 토 새벽 3시) 트리거 -> type_b
+          if [ -n "${{ github.event.inputs.collect_mode }}" ]; then
+            echo "mode=${{ github.event.inputs.collect_mode }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "0 9 * * 5" ]; then
+            echo "mode=type_a" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "0 18 * * 5" ]; then
+            echo "mode=type_b" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=both" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: 실행
         env:
           SITE_DOMAIN: ${{ secrets.SITE_DOMAIN }}
@@ -50,7 +69,7 @@ jobs:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           SHARE_EMAIL: ${{ secrets.SHARE_EMAIL }}
           GOOGLE_SA_KEY_JSON: ${{ secrets.GOOGLE_SA_KEY_JSON_ADMIN }}
-          COLLECT_MODE: ${{ github.event.inputs.collect_mode || 'both' }}
+          COLLECT_MODE: ${{ steps.mode.outputs.mode }}
           APSL_AMT_END: ${{ github.event.inputs.apsl_amt_end || '500000000' }}
         run: python crawler.py
 
@@ -58,7 +77,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: data-backup
+          name: data-backup-${{ steps.mode.outputs.mode }}
           path: /tmp/*_data*.xlsx
           if-no-files-found: ignore
           retention-days: 14
