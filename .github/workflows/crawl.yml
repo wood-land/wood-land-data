@@ -1,0 +1,64 @@
+name: 주간 데이터 수집
+
+on:
+  schedule:
+    # 매일 UTC 22시 = 한국시간(KST) 오전 7시. 필요하면 이 줄만 수정하세요.
+    - cron: "0 22 * * *"
+  workflow_dispatch:
+    inputs:
+      collect_mode:
+        description: "수집 범위"
+        required: false
+        default: "both"
+        type: choice
+        options:
+          - both
+          - type_a
+          - type_b
+      apsl_amt_end:
+        description: "상한 값 (원 단위, 예: 500000000 = 5억)"
+        required: false
+        default: "500000000"
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340  # GitHub Actions 무료 한도(360분)에 여유를 둔 값
+
+    steps:
+      - name: 저장소 코드 가져오기
+        uses: actions/checkout@v4
+
+      - name: Python 설치
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 패키지 설치
+        run: pip install -r requirements.txt
+
+      - name: 브라우저 설치
+        uses: browser-actions/setup-chrome@v1
+
+      - name: 실행
+        env:
+          SITE_DOMAIN: ${{ secrets.SITE_DOMAIN }}
+          SITE_LOGIN_ID: ${{ secrets.SITE_LOGIN_ID }}
+          SITE_LOGIN_PW: ${{ secrets.SITE_LOGIN_PW }}
+          TYPE_A_LABEL: ${{ secrets.TYPE_A_LABEL }}
+          TYPE_B_LABEL: ${{ secrets.TYPE_B_LABEL }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          SHARE_EMAIL: ${{ secrets.SHARE_EMAIL }}
+          GOOGLE_SA_KEY_JSON: ${{ secrets.GOOGLE_SA_KEY_JSON_ADMIN }}
+          COLLECT_MODE: ${{ github.event.inputs.collect_mode || 'both' }}
+          APSL_AMT_END: ${{ github.event.inputs.apsl_amt_end || '500000000' }}
+        run: python crawler.py
+
+      - name: 결과 파일을 실행 기록에 첨부 (백업용)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-backup
+          path: /tmp/*_data*.xlsx
+          if-no-files-found: ignore
+          retention-days: 14
