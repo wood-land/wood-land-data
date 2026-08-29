@@ -2,10 +2,10 @@ name: 주간 데이터 수집
 
 on:
   schedule:
-    # 금요일 오후 6시(KST) = 금요일 09:00 UTC → type_a 5시간 작업
-    - cron: "0 9 * * 5"
-    # 토요일 새벽 3시(KST) = 금요일 18:00 UTC → type_b 5시간 작업
-    - cron: "0 18 * * 5"
+    # 금요일 새벽 0시30분(KST) = 목요일 15:30 UTC → type_a 5시간 작업
+    - cron: "30 15 * * 4"
+    # 토요일 새벽 0시30분(KST) = 금요일 15:30 UTC → type_b 5시간 작업 (type_a와 정확히 24시간 간격)
+    - cron: "30 15 * * 5"
   workflow_dispatch:
     inputs:
       collect_mode:
@@ -47,13 +47,13 @@ jobs:
         run: |
           # 수동 실행(workflow_dispatch)이면 사람이 고른 값을 그대로 쓴다.
           # 예약 실행(schedule)이면 어느 cron이 트리거했는지로 자동 결정한다:
-          #   금요일 09:00 UTC(=한국시간 금 18시) 트리거 -> type_a
-          #   금요일 18:00 UTC(=한국시간 토 새벽 3시) 트리거 -> type_b
+          #   목요일 15:30 UTC(=한국시간 금 새벽 0시30분) 트리거 -> type_a
+          #   금요일 15:30 UTC(=한국시간 토 새벽 0시30분) 트리거 -> type_b
           if [ -n "${{ github.event.inputs.collect_mode }}" ]; then
             echo "mode=${{ github.event.inputs.collect_mode }}" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event.schedule }}" = "0 9 * * 5" ]; then
+          elif [ "${{ github.event.schedule }}" = "30 15 * * 4" ]; then
             echo "mode=type_a" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event.schedule }}" = "0 18 * * 5" ]; then
+          elif [ "${{ github.event.schedule }}" = "30 15 * * 5" ]; then
             echo "mode=type_b" >> "$GITHUB_OUTPUT"
           else
             echo "mode=both" >> "$GITHUB_OUTPUT"
