@@ -2,10 +2,10 @@ name: 주간 데이터 수집
 
 on:
   schedule:
-    # 금요일 새벽 0시30분(KST) = 목요일 15:30 UTC → type_a 5시간 작업
-    - cron: "30 15 * * 4"
-    # 토요일 새벽 0시30분(KST) = 금요일 15:30 UTC → type_b 5시간 작업 (type_a와 정확히 24시간 간격)
-    - cron: "30 15 * * 5"
+    # 금요일 새벽 1시(KST) = 목요일 16:00 UTC → type_a 5시간 작업
+    - cron: "0 16 * * 4"
+    # 토요일 새벽 2시(KST) = 금요일 17:00 UTC → type_b 5시간 작업 (type_a와 25시간 간격)
+    - cron: "0 17 * * 5"
   workflow_dispatch:
     inputs:
       collect_mode:
@@ -26,6 +26,19 @@ jobs:
   crawl:
     runs-on: ubuntu-latest
     timeout-minutes: 300  # 5시간
+    concurrency:
+      # 이 워크플로우가 동시에 두 번 실행되는 것을 막는다(예약 실행끼리 GitHub 자체의
+      # 지연으로 겹치는 경우 대비). group을 고정해두면 이미 실행 중인 작업이 있을 때
+      # 새 실행은 자동으로 대기열에 들어가 앞 작업이 끝난 뒤 시작된다.
+      # cancel-in-progress: false로 두어 진행 중인 실행을 취소하지 않고 끝까지 마친다.
+      #
+      # 참고: 예약 실행과 수동 실행은 이제 서로 다른 구글 시트 탭에 쓰도록
+      # crawler.py 쪽에서도 분리해뒀다(TRIGGER_TYPE 값 기준) - 그래서 이 동시 실행
+      # 방지 장치가 없어도 데이터가 서로를 덮어쓰는 사고는 이제 구조적으로 발생하지
+      # 않는다. 다만 같은 로그인 세션으로 사이트에 동시에 두 개의 브라우저가 접속하는
+      # 상황 자체는 피하는 게 안전하므로, 이 안전장치는 그대로 유지한다.
+      group: weekly-data-collection
+      cancel-in-progress: false
 
     steps:
       - name: 저장소 코드 가져오기
@@ -47,13 +60,13 @@ jobs:
         run: |
           # 수동 실행(workflow_dispatch)이면 사람이 고른 값을 그대로 쓴다.
           # 예약 실행(schedule)이면 어느 cron이 트리거했는지로 자동 결정한다:
-          #   목요일 15:30 UTC(=한국시간 금 새벽 0시30분) 트리거 -> type_a
-          #   금요일 15:30 UTC(=한국시간 토 새벽 0시30분) 트리거 -> type_b
+          #   목요일 16:00 UTC(=한국시간 금 새벽 1시) 트리거 -> type_a
+          #   금요일 17:00 UTC(=한국시간 토 새벽 2시) 트리거 -> type_b
           if [ -n "${{ github.event.inputs.collect_mode }}" ]; then
             echo "mode=${{ github.event.inputs.collect_mode }}" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event.schedule }}" = "30 15 * * 4" ]; then
+          elif [ "${{ github.event.schedule }}" = "0 16 * * 4" ]; then
             echo "mode=type_a" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event.schedule }}" = "30 15 * * 5" ]; then
+          elif [ "${{ github.event.schedule }}" = "0 17 * * 5" ]; then
             echo "mode=type_b" >> "$GITHUB_OUTPUT"
           else
             echo "mode=both" >> "$GITHUB_OUTPUT"
@@ -71,6 +84,10 @@ jobs:
           GOOGLE_SA_KEY_JSON: ${{ secrets.GOOGLE_SA_KEY_JSON_ADMIN }}
           COLLECT_MODE: ${{ steps.mode.outputs.mode }}
           APSL_AMT_END: ${{ github.event.inputs.apsl_amt_end || '500000000' }}
+          # 예약(schedule)으로 시작됐는지, 사람이 버튼으로(workflow_dispatch) 시작
+          # 했는지를 그대로 넘겨준다 - crawler.py가 이 값으로 예약 전용 탭을 쓸지,
+          # 수동 실행 전용(실행일자 기준) 탭을 쓸지 결정한다.
+          TRIGGER_TYPE: ${{ github.event_name }}
         run: python crawler.py
 
       - name: 결과 파일을 실행 기록에 첨부 (백업용)
