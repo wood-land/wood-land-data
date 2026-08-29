@@ -77,6 +77,17 @@ AUTOSAVE_EVERY_N_ITEMS = 50
 COLLECT_MODE_ENV = os.environ.get("COLLECT_MODE", "both")
 APSL_AMT_END_ENV = os.environ.get("APSL_AMT_END", "500000000")
 
+# --- GitHub Actions 환경변수 연동 (수집 범위/감정가 상한/실행 트리거 종류) ---
+COLLECT_MODE_ENV = os.environ.get("COLLECT_MODE", "both")
+APSL_AMT_END_ENV = os.environ.get("APSL_AMT_END", "500000000")
+# TRIGGER_TYPE: 워크플로우가 "schedule"(예약)로 시작됐는지, 그 외(수동 실행 등)로
+# 시작됐는지를 나타낸다. 워크플로우 파일에서 github.event_name 값을 그대로 넘겨준다.
+# 기본값을 "manual"로 둔 이유: 이 값을 못 받아오는 상황(예: 로컬에서 직접 실행,
+# 워크플로우 설정 누락 등)에서는 안전한 쪽(=예약 전용 탭을 건드리지 않는 별도 탭)으로
+# 동작하도록 하기 위함이다 - "schedule"로 잘못 오인해서 예약 데이터가 있는 탭을
+# 건드리는 사고보다는, 별도 탭에 쓰는 게 항상 더 안전하다.
+TRIGGER_TYPE_ENV = os.environ.get("TRIGGER_TYPE", "manual")
+
 _creds_json_env = os.environ.get("GOOGLE_SA_KEY_JSON", "")
 if _creds_json_env:
     _tmp_cred_path = "/tmp/google_credentials.json"
@@ -98,10 +109,10 @@ GOOGLE_CREDENTIALS_PATH = _resolve_google_credentials_path(GOOGLE_CREDENTIALS_PA
 오늘 = datetime.now()
 start_date_str = 오늘.strftime('%Y-%m-%d')
 end_date_str = (오늘 + timedelta(days=DAYS_AHEAD)).strftime('%Y-%m-%d')
-오늘날짜_숫자만 = 오늘.strftime("%Y%m%d")
-오늘_ISO주차_번호 = 오늘.isocalendar()[1]
-# 파일명/탭 이름에는 사이트를 식별할 수 있는 단어를 넣지 않고 범용 단어("data")만 사용한다.
-파일명 = f"{오늘날짜_숫자만}_W{오늘_ISO주차_번호:02d}_data.xlsx"
+# 로컬 엑셀 파일명은 main()에서 실제 사용된 구글 시트 탭 이름(예약 전용 탭인지 수동
+# 전용 탭인지에 따라 달라짐)에 맞춰 그 이름 그대로 ".xlsx"만 붙여서 결정한다 - 그래야
+# 어떤 실행이 만든 파일인지 파일명만 보고도 바로 알 수 있고, 탭 이름과 파일명이 항상
+# 정확히 짝을 이룬다.
 
 BASE_URL = f"{SITE_BASE}/ca/caList.php?srchHistory=1"
 
@@ -152,9 +163,23 @@ def _iso_week_label(dt):
 
 
 def _week_tab_name(dt):
+    """dt가 속한 ISO 주차의 "예약 실행 전용" 구글 시트 탭 이름을 만든다.
+    형식은 "YYYYMMDD_W주차_data"이며, YYYYMMDD는 그 주의 **토요일** 날짜다
+    (ISO 요일번호 6 = 토요일). 예약(schedule)으로 트리거된 실행만 이 탭을 쓴다."""
     iso_year, iso_week, _ = dt.isocalendar()
-    monday = date.fromisocalendar(iso_year, iso_week, 1)
-    return f"{monday.strftime('%Y%m%d')}_W{iso_week:02d}_data"
+    saturday = date.fromisocalendar(iso_year, iso_week, 6)
+    return f"{saturday.strftime('%Y%m%d')}_W{iso_week:02d}_data"
+
+
+def _manual_tab_name(dt):
+    """예약(schedule)이 아니라 사람이 직접(workflow_dispatch) 실행했을 때 쓰는 탭
+    이름을 만든다: "YYYYMMDD_manual_data" (dt=실행일). 예약 실행 전용 탭
+    (_week_tab_name)과 이름 패턴 자체가 달라서(주차 번호 "W.." 부분이 없음) 절대
+    같은 탭을 가리키지 않는다 - 예약 실행 도중이든 끝난 뒤든 언제 수동 실행을 하더라도
+    예약 데이터가 있는 탭을 절대 건드리지(=지우거나 덮어쓰지) 않는다. 같은 날 수동
+    실행을 여러 번 하면(예: 실패해서 재시도) 그 날짜의 탭 하나에 자연스럽게 이어서
+    쌓인다(증분 업데이트 로직이 그대로 적용됨)."""
+    return f"{dt.strftime('%Y%m%d')}_manual_data"
 
 
 WEEK_TAB_PATTERN = re.compile(r"^\d{8}_W\d{2}_data$")
@@ -1537,17 +1562,33 @@ def main():
     existing_case_numbers = set()
     existing_rows = []
 
+    # 예약(schedule) 실행인지 그 외(수동 실행 등)인지에 따라 완전히 다른 탭을 쓴다.
+    # 예약 실행끼리는(type_a/type_b) 서로 같은 주의 같은 탭을 공유해서 누적되지만,
+    # 사람이 직접 돌리는 실행은 그 탭을 절대 건드리지 않고 "실행일자" 전용 탭에
+    # 따로 쌓는다 - 예약 실행이 아직 진행 중이거나 막 끝난 시점에 수동 실행을 해도,
+    # 서로 다른 탭에 쓰기 때문에 한쪽이 다른 쪽을 덮어쓰는 사고 자체가 구조적으로
+    # 발생할 수 없다(2026-08-28~29에 실제로 겪은, "나중에 끝난 실행이 시트 전체를
+    # 자기 것으로 덮어써서 먼저 쌓인 데이터가 사라지는" 문제의 근본 해결책).
+    is_scheduled_run = (TRIGGER_TYPE_ENV == "schedule")
+
     google_sh = None
     current_week_ws = None
     prev_week_label = None
     current_week_label = None
     if GOOGLE_SHEETS_ENABLED:
         오늘_date = date.today()
-        current_week_label = _week_tab_name(오늘_date)
-        prev_week_label = _week_tab_name(오늘_date - timedelta(days=7))
-        print(f"\n=== 구글 시트 주차 탭: {current_week_label} ===")
-        print(f"이 탭에 이미 있는 사건번호는 상세페이지/PDF 요청 없이 건너뜁니다. "
-              f"지난주 탭({prev_week_label})과 비교해 매각완료로 추정되는 물건 수를 실행이 끝날 때 안내합니다.")
+        if is_scheduled_run:
+            current_week_label = _week_tab_name(오늘_date)
+            prev_week_label = _week_tab_name(오늘_date - timedelta(days=7))
+            print(f"\n=== 구글 시트 탭(예약 실행 전용): {current_week_label} ===")
+            print(f"이 탭에 이미 있는 사건번호는 상세페이지/PDF 요청 없이 건너뜁니다. "
+                  f"지난주 탭({prev_week_label})과 비교해 매각완료로 추정되는 물건 수를 실행이 끝날 때 안내합니다.")
+        else:
+            current_week_label = _manual_tab_name(오늘_date)
+            prev_week_label = _week_tab_name(오늘_date - timedelta(days=7))
+            print(f"\n=== 구글 시트 탭(수동 실행 전용): {current_week_label} ===")
+            print(f"수동 실행이라 예약 전용 탭과는 별도의 탭에 저장됩니다 - 예약 실행 데이터에는 "
+                  f"전혀 영향을 주지 않습니다. 같은 날 다시 수동 실행하면 이 탭에 이어서 누적됩니다.")
         print(f"새 물건 {AUTOSAVE_EVERY_N_ITEMS}건마다 자동으로 중간 저장합니다.")
         if os.path.exists(GOOGLE_CREDENTIALS_PATH):
             print(f"서비스 계정 키 파일: {GOOGLE_CREDENTIALS_PATH} (이 실행 환경에서 찾음)")
@@ -1567,6 +1608,11 @@ def main():
     if FETCH_DETAIL_DOCS:
         sheet.cell(row=1, column=AC_COL, value="토지등기_요약(지분물건만, 임시)")
 
+    # 로컬 엑셀 파일명은 실제 사용된 탭 이름 그대로 ".xlsx"만 붙인다(탭 이름이
+    # current_week_label 하나로 이미 예약/수동 여부까지 반영되어 있으므로).
+    # GOOGLE_SHEETS_ENABLED=False라 current_week_label이 없을 때는 실행일자
+    # 기준 이름으로 대체한다(하위 호환).
+    파일명 = f"{current_week_label or _manual_tab_name(date.today())}.xlsx"
     save_path = os.path.join(SAVE_DIR, 파일명)
     if os.path.exists(save_path):
         base, ext = os.path.splitext(save_path)
@@ -1841,7 +1887,7 @@ def main():
         if GOOGLE_SHEETS_ENABLED and current_week_ws is not None:
             sync_to_google_sheet(sheet, current_week_ws)
 
-            if (ca_scan_complete or pa_scan_complete) and google_sh is not None:
+            if is_scheduled_run and (ca_scan_complete or pa_scan_complete) and google_sh is not None:
                 prev_week_ws = get_tab_if_exists(google_sh, prev_week_label)
                 prev_ca_set, prev_pa_set = load_case_numbers_by_type_from_gsheet(prev_week_ws)
                 sold_out_ca = (prev_ca_set - scanned_case_numbers_ca) if ca_scan_complete else set()
@@ -1852,7 +1898,10 @@ def main():
                           f"물건 {sold_out_total}건(매각완료 등으로 추정, {TYPE_A_LABEL} {len(sold_out_ca)}건 / "
                           f"{TYPE_B_LABEL} {len(sold_out_pa)}건)이 있습니다.")
 
-            if google_sh is not None:
+            # 오래된 탭 자동 정리도 예약 실행일 때만 수행한다 - 수동 실행(수동 전용
+            # 탭 이름 패턴이라 어차피 WEEK_TAB_PATTERN에 안 걸려 청소 대상이 되지도
+            # 않지만) 도중에 매번 정리 API 호출까지 할 필요는 없으므로 함께 건너뛴다.
+            if is_scheduled_run and google_sh is not None:
                 cleanup_old_week_tabs(google_sh, GOOGLE_SHEET_WEEK_RETENTION)
 
         workbook.save(save_path)
