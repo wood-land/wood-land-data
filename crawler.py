@@ -290,6 +290,69 @@ def get_tab_if_exists(sh, tab_name):
         return None
 
 
+def _build_header_row():
+    """TEMPLATE_HEADERS + AC_COL(토지등기 요약) 자리까지 채운 헤더 행 한 줄을 만든다."""
+    header_row = list(TEMPLATE_HEADERS)
+    while len(header_row) < AC_COL:
+        header_row.append("")
+    header_row[AC_COL - 1] = "토지등기_요약(지분물건만, 임시)"
+    return header_row
+
+
+def ensure_header_row(ws):
+    """탭을 열거나 새로 만든 직후, 반드시 이 함수부터 호출해서 헤더 행이 있는지
+    확인/보장한다.
+
+    (2026-09-05 발견된 버그 수정) 기존에는 헤더 행이 "실행이 끝까지 완전히
+    성공했을 때"만 마지막 sync_to_google_sheet()에서 한 번 쓰였다. 그런데
+    실행 도중의 중간 저장(append_new_rows_to_gsheet, 50건마다)은 "헤더가 이미
+    있다"고 가정하고 그 다음 행부터 이어붙이기만 한다 - 새로 만든 빈 탭은
+    아직 헤더가 없으므로, 이 중간 저장이 원격 시트의 "데이터가 있는 마지막
+    행 다음"(=빈 시트라 1행)에 그대로 물건 데이터를 써버려서, 헤더 자리를
+    데이터가 차지해버리는 문제가 있었다. 만약 그 실행이 끝까지 완전히
+    성공하지 못하면(도중에 구글 시트 저장만 조용히 실패하는 경우 등, GitHub
+    Actions 자체는 "Success"로 표시될 수 있음) 이 헤더 없는 상태가 그대로
+    굳어버린다(실제로 20260905_W36_data 탭에서 이 증상이 확인됨).
+
+    이 함수는 두 가지 상황을 모두 처리한다:
+    1) 탭이 완전히 비어있으면 -> 헤더 행을 1행에 즉시 써넣는다(데이터 수집을
+       시작하기 전에 미리 해두므로, 이후 중간 저장이 실행 완료 여부와 무관하게
+       항상 2행부터 정확하게 쌓인다).
+    2) 탭에 이미 내용이 있는데 1행이 정상적인 헤더가 아니라 물건 데이터로
+       보이면(위 버그로 이미 망가진 탭) -> 헤더 행을 1행에 삽입해서 기존
+       데이터를 전부 한 칸씩 아래로 밀어내고 자동으로 복구한다.
+    이미 정상적인 헤더가 있으면(1행에 "사건번호"가 포함되어 있으면) 아무것도
+    하지 않는다. 어떤 경우든 예외가 나도 크롤링 자체를 막지 않도록 조용히
+    로그만 남긴다."""
+    if ws is None:
+        return
+    try:
+        existing = ws.get_all_values()
+    except Exception as e:
+        print(f"[구글시트] '{ws.title}' 헤더 확인 중 오류: {e}")
+        return
+
+    header_row = _build_header_row()
+
+    if not existing:
+        try:
+            ws.update(values=[header_row], range_name="A1")
+            print(f"[구글시트] 새 탭 '{ws.title}'에 헤더 행을 미리 기록했습니다.")
+        except Exception as e:
+            print(f"[구글시트] '{ws.title}'에 헤더 행을 미리 쓰는 데 실패했습니다: {e}")
+        return
+
+    first_row = existing[0]
+    if "사건번호" in first_row:
+        return  # 이미 정상적인 헤더가 있음
+
+    try:
+        ws.insert_row(header_row, index=1)
+        print(f"[구글시트] '{ws.title}' 탭에 헤더가 없어 자동으로 복구(1행에 삽입)했습니다.")
+    except Exception as e:
+        print(f"[구글시트] '{ws.title}' 헤더 자동 복구에 실패했습니다: {e}")
+
+
 def load_existing_data_from_gsheet(ws):
     if ws is None:
         return set(), []
@@ -374,6 +437,77 @@ def load_case_numbers_by_type_from_gsheet(ws):
     return ca_set, pa_set
 
 
+# --- 실행 이력(감사 로그) ---
+# 매 실행이 끝날 때마다 요약 정보 한 줄을 이 탭에 누적 기록한다. 주차별 데이터
+# 탭(WEEK_TAB_PATTERN)과 이름 패턴이 달라서 cleanup_old_week_tabs()의 정리
+# 대상이 되지 않으므로, 지금까지 총 몇 번 실행했는지/데이터가 얼마나 누적
+# 됐는지를 한 곳에서 계속 추적할 수 있다.
+RUN_LOG_TAB_NAME = "_run_log"
+RUN_LOG_HEADERS = [
+    "실행시각(KST)", "트리거", "수집범위", "대상탭",
+    "시작전_원격행수", "종료후_원격행수", "이번실행_신규건수", "이번실행_건너뛴기존건수",
+    "검증결과", "비고",
+]
+
+
+def ensure_run_log_tab(sh):
+    """실행 이력 탭을 열거나(없으면) 새로 만들고, 헤더가 없으면 채워둔다."""
+    if sh is None:
+        return None
+    try:
+        ws = sh.worksheet(RUN_LOG_TAB_NAME)
+    except gspread.exceptions.WorksheetNotFound:
+        try:
+            ws = sh.add_worksheet(title=RUN_LOG_TAB_NAME, rows=2000, cols=len(RUN_LOG_HEADERS) + 2)
+            ws.update(values=[RUN_LOG_HEADERS], range_name="A1")
+            print(f"[실행이력] '{RUN_LOG_TAB_NAME}' 탭을 새로 만들었습니다.")
+        except Exception as e:
+            print(f"[실행이력] 탭 생성 실패: {e}")
+            return None
+    except Exception as e:
+        print(f"[실행이력] 탭을 여는 데 실패했습니다: {e}")
+        return None
+
+    try:
+        existing = ws.get_all_values()
+        if not existing:
+            ws.update(values=[RUN_LOG_HEADERS], range_name="A1")
+    except Exception as e:
+        print(f"[실행이력] 헤더 확인 중 오류(치명적이지 않음): {e}")
+    return ws
+
+
+def log_run_summary(sh, summary: dict):
+    """이번 실행의 요약 정보 한 줄을 실행 이력 탭에 추가한다. 이 로그 자체가
+    실패해도(네트워크 오류 등) 크롤링 결과 저장에는 전혀 영향을 주지 않도록
+    예외를 조용히 처리한다."""
+    ws = ensure_run_log_tab(sh)
+    if ws is None:
+        return
+    row = [summary.get(h, "") for h in RUN_LOG_HEADERS]
+    try:
+        ws.append_row(row, value_input_option="RAW")
+        print(f"[실행이력] 기록 완료 - 대상탭: {summary.get('대상탭')}, "
+              f"신규: {summary.get('이번실행_신규건수')}건, 검증결과: {summary.get('검증결과')}")
+    except Exception as e:
+        print(f"[실행이력] 기록 실패(치명적이지 않음): {e}")
+
+
+def count_total_runs(sh):
+    """지금까지 총 몇 번 실행됐는지(실행 이력 탭의 데이터 행 수)를 센다.
+    탭이 없거나 읽기에 실패하면 None을 반환한다."""
+    if sh is None:
+        return None
+    ws = get_tab_if_exists(sh, RUN_LOG_TAB_NAME)
+    if ws is None:
+        return 0  # 아직 한 번도 로그가 기록된 적 없음(이번이 사실상 첫 실행)
+    try:
+        values = ws.get_all_values()
+        return max(0, len(values) - 1)  # 헤더 제외
+    except Exception:
+        return None
+
+
 def cleanup_old_week_tabs(sh, retention=GOOGLE_SHEET_WEEK_RETENTION):
     if sh is None:
         return 0
@@ -430,10 +564,56 @@ def _apply_gsheet_formatting_range(ws, start_row, end_row, n_cols):
         print(f"[구글시트] 서식(줄바꿈/콤마) 적용 중 오류가 발생했지만 데이터 저장에는 영향이 없습니다: {e}")
 
 
-def sync_to_google_sheet(local_sheet, ws):
-    if ws is None:
-        return False
+def _get_remote_row_count(ws):
+    """구글 시트 탭에 실제로 몇 행이 들어있는지 '전체를 읽어와서' 확인한다.
+    시트의 모든 행/열 데이터를 통째로 내려받는 방식이라(get_all_values), 정확한
+    총 행 수가 꼭 필요한 경우(예: 실행 마지막의 전체 덮어쓰기 안전장치)에만 쓴다.
+    시트가 커질수록 이 호출 자체의 비용도 커지므로, 실행 도중 반복 호출되는
+    가벼운 재확인 용도로는 대신 _remote_row_has_data()를 쓴다.
+    읽기 자체가 실패하면(네트워크 오류 등) None을 반환한다."""
     try:
+        return len(ws.get_all_values())
+    except Exception as e:
+        print(f"[검증] '{ws.title}' 탭의 실제 행 수를 확인하지 못했습니다: {e}")
+        return None
+
+
+def _remote_row_has_data(ws, row_number, col=2):
+    """시트 전체를 내려받지 않고, 딱 하나의 셀(기본: 사건번호 열)만 가볍게
+    확인한다 - "이 행까지 데이터가 실제로 들어갔는지"를 저비용으로 확인하는
+    용도. get_all_values()가 전체 데이터를 통째로 가져오는 것과 달리, 이건
+    셀 하나에 대한 요청 한 번뿐이라 시트 크기와 무관하게 항상 가볍다. 자동저장
+    중간중간의 주기적 재확인(maybe_autosave)은 이 방식을 쓴다."""
+    try:
+        value = ws.cell(row_number, col).value
+        return bool(value)
+    except Exception as e:
+        print(f"[검증] {row_number}행 확인 중 오류: {e}")
+        return None
+
+
+def sync_to_google_sheet(local_sheet, ws):
+    """로컬 엑셀 시트의 전체 내용을 구글 시트 탭에 통째로 덮어써서 미러링한다.
+
+    (2026-09-06 안전장치 추가) 덮어쓰기 직전에 원격 탭의 "현재" 행 수를 먼저
+    확인한다. 만약 원격에 이미 있는 행 수가 지금 이 실행이 쓰려는 내용보다
+    "더 많으면" - 이는 이 실행이 시작된 뒤 다른 실행(동시 실행, 또는 이 실행이
+    미처 몰랐던 추가 데이터)이 원격에 더 많은 데이터를 이미 쌓아뒀다는 뜻이므로,
+    그걸 이 실행이 가진 "더 적은" 내용으로 덮어써서 지워버리는 사고
+    (2026-08-28~29에 실제로 발생 확인)를 막기 위해 **덮어쓰기 자체를 건너뛴다**.
+    이런 경우 원격에는 이미 충분한(또는 더 많은) 데이터가 안전하게 있으므로
+    손대지 않는 것이 항상 더 안전하다 - 이 실행이 자기가 새로 모은 데이터는
+    이미 실행 도중 append_new_rows_to_gsheet()로 증분 저장됐으므로 유실되지 않는다.
+
+    저장을 실제로 수행한 뒤에는 원격 탭을 다시 읽어 실제 행 수가 방금 쓴
+    내용과 정확히 일치하는지 확인한다(사후 검증) - 불일치하면 경고를 남긴다.
+
+    반환값: (성공여부: bool, 저장전_원격행수: int|None, 저장후_원격행수: int|None)"""
+    if ws is None:
+        return False, None, None
+    try:
+        remote_before = _get_remote_row_count(ws)
+
         values = []
         for row in local_sheet.iter_rows(values_only=True):
             values.append([_gsheet_json_safe(v) for v in row])
@@ -441,6 +621,15 @@ def sync_to_google_sheet(local_sheet, ws):
         n_rows = max(len(values), 1)
         n_cols = max((len(r) for r in values), default=1)
         n_cols = max(n_cols, AC_COL)
+
+        # --- 사전 검증: 덮어쓰면 오히려 행 수가 줄어드는지 확인 ---
+        if remote_before is not None and remote_before > n_rows:
+            print(f"[구글시트] ⚠️ 덮어쓰기 안전장치 작동: 원격 탭에 이미 {remote_before}행이 "
+                  f"있는데 이번 실행이 쓰려는 내용은 {n_rows}행뿐입니다(더 적음). 데이터 손실을 "
+                  f"막기 위해 전체 덮어쓰기를 건너뜁니다 - 원격 데이터는 그대로 안전하게 남아있고, "
+                  f"이 실행이 새로 모은 데이터는 이미 실행 도중 증분 저장으로 반영되어 있습니다.")
+            return True, remote_before, remote_before
+
         needed_rows = n_rows + 10
         needed_cols = n_cols + 2
         if ws.row_count < needed_rows or ws.col_count < needed_cols:
@@ -449,15 +638,33 @@ def sync_to_google_sheet(local_sheet, ws):
         ws.clear()
         ws.update(values=values, range_name="A1")
         _apply_gsheet_formatting(ws, n_rows, n_cols)
+
+        # --- 사후 검증: 실제로 저장된 행 수가 예상과 일치하는지 재확인 ---
+        remote_after = _get_remote_row_count(ws)
+        if remote_after is None:
+            print(f"[검증] 저장 후 실제 행 수를 다시 확인하지 못했습니다 - 저장 자체는 완료됐습니다.")
+        elif remote_after != n_rows:
+            print(f"[검증] ⚠️ 불일치 발견: 저장 후 실제 행 수({remote_after})가 "
+                  f"예상 행 수({n_rows})와 다릅니다. 탭을 직접 확인해보세요: {ws.title}")
+        else:
+            print(f"[검증] ✅ 저장 후 실제 행 수가 예상과 정확히 일치합니다 ({remote_after}행).")
+
         print(f"[구글시트] 동기화 완료: {len(values) - 1 if values else 0}건 "
               f"(스프레드시트 ID: {GOOGLE_SHEET_ID or '(신규 생성)'} / 탭: {ws.title})")
-        return True
+        return True, remote_before, remote_after
     except Exception as e:
         print(f"[구글시트] 업로드 중 오류가 발생해 이번에는 건너뜁니다: {e}")
-        return False
+        return False, None, None
 
 
 def append_new_rows_to_gsheet(local_sheet, ws, sync_state):
+    """마지막 동기화 이후 새로 추가된 행만 구글 시트에 append한다.
+
+    (2026-09-06) 자동저장(보통 50건마다)마다 실행되는 함수라, 여기서 매번 시트
+    전체를 다시 읽어 검증하면(get_all_values) 실행 내내 반복되는 부담이 커진다
+    - append_rows() API 호출 자체가 실패하면 예외로 걸러지므로(아래 except),
+    추가 검증 읽기 없이도 실패 감지는 충분하다. 무거운 검증은 실행 전체에서
+    딱 한 번(마지막 전체 저장 시점, sync_to_google_sheet)에만 집중한다."""
     if ws is None:
         return False
     try:
@@ -480,6 +687,7 @@ def append_new_rows_to_gsheet(local_sheet, ws, sync_state):
         ws.append_rows(new_values, value_input_option="RAW")
         _apply_gsheet_formatting_range(ws, last_synced + 1, max_row, n_cols)
         sync_state["synced_rows"] = max_row
+
         print(f"[구글시트] 증분 동기화 완료: {len(new_values)}건 추가 (누적 {max_row - 1}건, 탭: {ws.title})")
         return True
     except Exception as e:
@@ -488,10 +696,31 @@ def append_new_rows_to_gsheet(local_sheet, ws, sync_state):
 
 
 def maybe_autosave(sheet, ws, save_path, total_new_count, sync_state):
+    """새 물건이 AUTOSAVE_EVERY_N_ITEMS개 모일 때마다 중간 저장한다.
+
+    검증 방식: 이번 저장을 하기 **전에**, 직전 자동저장이 마지막으로 기록해둔
+    "마지막 행 번호"(sync_state["synced_rows"])에 지금도 데이터가 그대로 있는지
+    셀 1개만 가볍게 확인한다(_remote_row_has_data - 시트 전체를 내려받지
+    않으므로 시트가 커져도 비용이 항상 일정함). 이렇게 "쓰기 전에 직전 상태부터
+    확인"하면, 혹시 그 사이(직전 자동저장 이후 지금까지) 다른 실행이 이 탭을
+    건드렸거나 지워버린 경우를 다음 데이터를 쓰기 전에 미리 감지할 수 있다
+    (문제가 생기고 나서 한참 뒤에야 알아채는 것보다 한 배치 더 빨리 발견됨).
+    비용이 셀 1개 조회뿐이라 매 자동저장마다(50건마다) 수행해도 부담이 없다."""
     if total_new_count <= 0 or total_new_count % AUTOSAVE_EVERY_N_ITEMS != 0:
         return
     print(f"[자동 저장] 지금까지 새로 수집한 물건 {total_new_count}건 - 중간 저장 중...")
     if GOOGLE_SHEETS_ENABLED and ws is not None:
+        prev_last_row = sync_state.get("synced_rows", 1)
+        if prev_last_row > 1:  # 1행(헤더)뿐이면 아직 비교할 이전 저장분이 없음
+            still_there = _remote_row_has_data(ws, prev_last_row)
+            if still_there is None:
+                print(f"[검증] 직전 저장분({prev_last_row}행) 확인 실패(네트워크) - 이번 저장은 그대로 진행합니다.")
+            elif not still_there:
+                print(f"[검증] ⚠️ 직전 자동저장까지 있었어야 할 {prev_last_row}행이 지금 비어있습니다! "
+                      f"다른 실행이 이 탭을 건드렸을 수 있으니 나중에 결과를 꼭 확인하세요.")
+            else:
+                print(f"[검증] ✅ 직전 저장분({prev_last_row}행) 그대로 있음 확인.")
+
         append_new_rows_to_gsheet(sheet, ws, sync_state)
     try:
         sheet.parent.save(save_path)
@@ -1575,6 +1804,8 @@ def main():
     current_week_ws = None
     prev_week_label = None
     current_week_label = None
+    run_start_remote_rows = None
+    total_runs_so_far = None
     if GOOGLE_SHEETS_ENABLED:
         오늘_date = date.today()
         if is_scheduled_run:
@@ -1599,6 +1830,15 @@ def main():
         if google_sh is not None:
             current_week_ws = get_or_create_tab(google_sh, current_week_label)
             if current_week_ws is not None:
+                ensure_header_row(current_week_ws)
+                run_start_remote_rows = _get_remote_row_count(current_week_ws)
+                total_runs_so_far = count_total_runs(google_sh)
+                if total_runs_so_far is not None:
+                    print(f"[실행이력] 지금까지 이 프로젝트에서 총 {total_runs_so_far}번 실행됐습니다 "
+                          f"(이번 실행이 {total_runs_so_far + 1}번째).")
+                if run_start_remote_rows is not None:
+                    print(f"[검증] 이번 실행 시작 시점, 대상 탭('{current_week_label}')에는 "
+                          f"이미 {run_start_remote_rows}행(헤더 포함)이 있습니다.")
                 existing_case_numbers, existing_rows = load_existing_data_from_gsheet(current_week_ws)
 
     workbook = Workbook()
@@ -1885,7 +2125,36 @@ def main():
         print("페이지 갱신 중 요소 참조가 끊겼습니다. 지금까지 수집된 데이터로 저장합니다.")
     finally:
         if GOOGLE_SHEETS_ENABLED and current_week_ws is not None:
-            sync_to_google_sheet(sheet, current_week_ws)
+            sync_ok, remote_before_final, remote_after_final = sync_to_google_sheet(sheet, current_week_ws)
+
+            # --- 검증 결과 문구 결정 ---
+            expected_rows = sheet.max_row
+            if not sync_ok:
+                verification_result = "저장실패(로그 참고)"
+            elif remote_after_final is None:
+                verification_result = "확인불가(네트워크)"
+            elif remote_before_final is not None and remote_after_final == remote_before_final and \
+                    remote_before_final >= expected_rows:
+                verification_result = "건너뜀(원격이 이미 더 많음, 안전)"
+            elif remote_after_final == expected_rows:
+                verification_result = "OK"
+            else:
+                verification_result = f"불일치(예상{expected_rows}/실제{remote_after_final})"
+
+            # --- 실행 이력 한 줄 기록 ---
+            if google_sh is not None:
+                log_run_summary(google_sh, {
+                    "실행시각(KST)": (datetime.utcnow() + timedelta(hours=9)).strftime("%Y-%m-%d %H:%M:%S"),
+                    "트리거": "schedule" if is_scheduled_run else "manual",
+                    "수집범위": collect_mode,
+                    "대상탭": current_week_label,
+                    "시작전_원격행수": run_start_remote_rows if run_start_remote_rows is not None else "",
+                    "종료후_원격행수": remote_after_final if remote_after_final is not None else "",
+                    "이번실행_신규건수": total_new_count,
+                    "이번실행_건너뛴기존건수": total_skip_existing,
+                    "검증결과": verification_result,
+                    "비고": "" if sync_ok else "구글시트 저장 단계에서 오류 발생 - 로그 확인 필요",
+                })
 
             if is_scheduled_run and (ca_scan_complete or pa_scan_complete) and google_sh is not None:
                 prev_week_ws = get_tab_if_exists(google_sh, prev_week_label)
