@@ -12,6 +12,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
 from datetime import datetime, timedelta, date
 import os
+import sys
 import time
 import re
 import random
@@ -73,13 +74,12 @@ GOOGLE_CREDENTIALS_PATH_CANDIDATES = []
 GOOGLE_SHEET_WEEK_RETENTION = 3
 AUTOSAVE_EVERY_N_ITEMS = 50
 
-# --- GitHub Actions 환경변수 연동 (수집 범위/감정가 상한) ---
+# --- GitHub Actions 환경변수 연동 (수집 범위/최저가격 상한/실행 트리거 종류) ---
 COLLECT_MODE_ENV = os.environ.get("COLLECT_MODE", "both")
-APSL_AMT_END_ENV = os.environ.get("APSL_AMT_END", "500000000")
-
-# --- GitHub Actions 환경변수 연동 (수집 범위/감정가 상한/실행 트리거 종류) ---
-COLLECT_MODE_ENV = os.environ.get("COLLECT_MODE", "both")
-APSL_AMT_END_ENV = os.environ.get("APSL_AMT_END", "500000000")
+# (2026-09-07, 로컬 v32 반영) 감정가격(APSL) 기준 대신 최저가격(MINB) 기준으로 필터링한다.
+# 워크플로우/Secrets 쪽 입력 이름은 하위 호환을 위해 그대로 APSL_AMT_END를 유지하되,
+# 내부적으로는 "최저가격 상한"을 의미하는 값으로 사용한다.
+MINB_AMT_END_ENV = os.environ.get("APSL_AMT_END", "500000000")
 # TRIGGER_TYPE: 워크플로우가 "schedule"(예약)로 시작됐는지, 그 외(수동 실행 등)로
 # 시작됐는지를 나타낸다. 워크플로우 파일에서 github.event_name 값을 그대로 넘겨준다.
 # 기본값을 "manual"로 둔 이유: 이 값을 못 받아오는 상황(예: 로컬에서 직접 실행,
@@ -87,6 +87,7 @@ APSL_AMT_END_ENV = os.environ.get("APSL_AMT_END", "500000000")
 # 동작하도록 하기 위함이다 - "schedule"로 잘못 오인해서 예약 데이터가 있는 탭을
 # 건드리는 사고보다는, 별도 탭에 쓰는 게 항상 더 안전하다.
 TRIGGER_TYPE_ENV = os.environ.get("TRIGGER_TYPE", "manual")
+
 
 _creds_json_env = os.environ.get("GOOGLE_SA_KEY_JSON", "")
 if _creds_json_env:
@@ -299,6 +300,100 @@ def _build_header_row():
     return header_row
 
 
+def _find_row_data_start(row_values):
+    """이 행 안에서 실제 물건 데이터가 시작되는 열(0-based 인덱스)을 찾는다.
+    모든 정상적인 데이터 행의 맨 첫 필드 값은 항상 TYPE_A_LABEL 또는
+    TYPE_B_LABEL과 정확히 같으므로(예: 물건종류를 나타내는 짧은 단어 리터럴), 그 값이
+    있는 칸을 찾으면 그 행의 진짜 데이터 시작 위치를 알 수 있다 - 사건번호
+    패턴(정규식)보다 이 리터럴 값이 더 확실한 기준점이다(사건번호는 형식이
+    여러 가지라 오탐 가능성이 있지만, 이 라벨 값은 절대 다른 의미로 쓰이지
+    않는다).
+
+    0번째 열부터 먼저 확인한다 - 이미 정상적으로 정렬된 행은 항상 0번째 열에
+    라벨이 있으므로 즉시 통과되고, 뒤쪽 열까지 뒤질 필요가 없다. 0번째 열이
+    라벨이 아닐 때만 나머지 열을 마저 찾는다 - 그래야 '참고사항'이나 '주소'
+    같은 자유 텍스트 칸에 우연히 라벨과 같은 문자열이 들어있어도(예: 참고사항이
+    그 글자만 딱 들어있는 극히 드문 경우), 이미 정상인 행을 오탐으로 잘못
+    건드리는 일을 방지한다. 못 찾으면 None을 반환한다."""
+    if row_values and row_values[0] in (TYPE_A_LABEL, TYPE_B_LABEL):
+        return 0
+    for idx, val in enumerate(row_values):
+        if val in (TYPE_A_LABEL, TYPE_B_LABEL):
+            return idx
+    return None
+
+
+def repair_shifted_data_columns(ws):
+    """(2026-09-12 발견) append_rows()에 table_range를 지정하지 않아서 구글시트
+    API가 표 위치를 잘못 추측해, 실제 물건 데이터 전체가 헤더보다 한참 오른쪽
+    열(예: AC열, 심지어 700번째 열 이상)부터 시작해버리는 사고가 있었다. 더
+    심각한 건 이 오작동이 자동저장(50건마다)마다 매번 다시 발생하면서, 밀리는
+    정도가 배치마다 점점 더 심해져 누적됐다는 점이다(실제 확인된 사례: 같은
+    탭 안에서 어떤 행은 29열부터, 어떤 행은 701열부터 시작 - 행마다 밀린 정도가
+    전부 다름). 그래서 "탭 전체에 대해 한 번만 계산한 하나의 오프셋"으로는 이
+    탭을 복구할 수 없고, **행 하나하나마다 개별적으로** 실제 데이터가 어디서
+    시작하는지 찾아서 그만큼씩 왼쪽으로 당겨와야 한다(_find_row_data_start).
+
+    ensure_header_row()가 처리하는 "헤더 자체가 아예 없는" 문제와는 완전히
+    다른 종류의 손상이라(이쪽은 헤더는 멀쩡하고 데이터만 밀림) 별도 함수로
+    처리한다. 헤더에 '사건번호'가 없으면(=ensure_header_row가 처리할 몫) 이
+    함수는 아무것도 하지 않고 조용히 넘어간다. 밀린 행이 하나도 없으면(모든
+    행이 정상적으로 1열부터 시작) 역시 아무것도 하지 않는다 - 매번 불필요하게
+    시트를 다시 쓰지 않기 위함이다."""
+    if ws is None:
+        return
+    try:
+        all_values = ws.get_all_values()
+    except Exception as e:
+        print(f"[구글시트] '{ws.title}' 데이터 정렬 확인 중 오류: {e}")
+        return
+    if len(all_values) < 2:
+        return
+
+    header_row = all_values[0]
+    if "사건번호" not in header_row:
+        return  # 헤더 자체가 없는 문제는 ensure_header_row()가 처리
+
+    n_fields = len(TEMPLATE_HEADERS)
+    ac_relative_offset = AC_COL - 1  # 0-based, 첫 필드 열 기준 AC열까지의 상대 거리
+
+    needs_repair = False
+    fixed_rows = [header_row]
+    for row in all_values[1:]:
+        start = _find_row_data_start(row)
+        if start is None:
+            fixed_rows.append(row)  # 패턴을 못 찾은 행은 원본 그대로 보존(안전 우선)
+            continue
+        if start != 0:
+            needs_repair = True
+        core = list(row[start:start + n_fields])
+        while len(core) < n_fields:
+            core.append("")
+        ac_idx = start + ac_relative_offset
+        ac_val = row[ac_idx] if ac_idx < len(row) else ""
+        new_row = core
+        while len(new_row) < AC_COL:
+            new_row.append("")
+        new_row[AC_COL - 1] = ac_val
+        fixed_rows.append(new_row)
+
+    if not needs_repair:
+        return
+
+    print(f"[구글시트] ⚠️ '{ws.title}' 탭에서 데이터 열이 행마다 다르게 밀려있는 것을 "
+          f"발견해 자동으로 재정렬합니다 (총 {len(fixed_rows) - 1}행, 시간이 걸릴 수 있습니다)...")
+    try:
+        needed_rows = len(fixed_rows) + 10
+        needed_cols = AC_COL + 2
+        if ws.row_count < needed_rows or ws.col_count < needed_cols:
+            ws.resize(rows=max(ws.row_count, needed_rows), cols=max(ws.col_count, needed_cols))
+        ws.clear()
+        ws.update(values=fixed_rows, range_name="A1")
+        print(f"[구글시트] ✅ '{ws.title}' 탭 데이터 재정렬 완료.")
+    except Exception as e:
+        print(f"[구글시트] 데이터 재정렬 중 오류가 발생했습니다: {e}")
+
+
 def ensure_header_row(ws):
     """탭을 열거나 새로 만든 직후, 반드시 이 함수부터 호출해서 헤더 행이 있는지
     확인/보장한다.
@@ -508,6 +603,64 @@ def count_total_runs(sh):
         return None
 
 
+# --- 임시 배치 탭 (실행 중 데이터를 공유 탭과 격리해서 저장) ---
+# (2026-09-12 추가) 기존에는 실행 도중 50건마다 바로 "공유 주간 탭"(다른 실행/지난
+# 실행들의 데이터가 이미 쌓여있는 그 탭)에 직접 append했다. 이러면 실행 도중
+# 무엇이든 잘못되면(네트워크 문제, API 오작동, 예외 등) 그 공유 탭 자체가 영향을
+# 받을 위험이 있다. 이제는 이번 "실행 1회" 전용의 완전히 격리된 임시 탭을 만들어서
+# 실행 도중에는 거기에만 저장하고, 실행이 끝나고 검증까지 통과했을 때 딱 한 번만
+# 공유 탭에 안전하게 반영(merge)한다 - 그래야 실행 도중 무슨 일이 생겨도 이미
+# 쌓여있던 공유 탭의 과거 데이터는 전혀 손대지 않는다.
+BATCH_TAB_PREFIX = "_batch_"
+
+
+def _batch_tab_name(week_label, run_start_dt):
+    """이번 실행 전용 임시 탭 이름을 만든다. 실행 시작 시각(초 단위)까지 포함해서
+    같은 주 안에서 여러 번 실행해도, 심지어 거의 동시에 두 실행이 겹쳐도 서로
+    다른 임시 탭을 쓰게 된다(이름이 절대 겹치지 않음)."""
+    return f"{BATCH_TAB_PREFIX}{week_label}_{run_start_dt.strftime('%Y%m%d%H%M%S')}"
+
+
+BATCH_TAB_PATTERN = re.compile(r"^_batch_.+_\d{14}$")
+
+
+def cleanup_orphaned_batch_tabs(sh, max_age_hours=12):
+    """실행이 중간에 죽어서(강제 종료 등) 끝까지 못 가 미처 정리되지 못하고 남은
+    오래된 임시 배치 탭을 청소한다. 이름에 박힌 실행 시작 시각을 파싱해서
+    max_age_hours시간보다 오래된 것만 지운다 - 지금 막 다른 실행이 만들어서
+    한창 쓰고 있는 임시 탭까지 실수로 지우지 않기 위한 안전장치다(정상적인
+    실행은 보통 5시간 이내에 끝나므로 12시간이면 충분히 안전한 여유)."""
+    if sh is None:
+        return 0
+    try:
+        titles = [ws.title for ws in sh.worksheets()]
+    except Exception as e:
+        print(f"[구글시트] 탭 목록을 가져오는 데 실패해 임시 탭 정리를 건너뜁니다: {e}")
+        return 0
+
+    now = datetime.utcnow() + timedelta(hours=9)
+    removed = 0
+    for title in titles:
+        if not BATCH_TAB_PATTERN.match(title):
+            continue
+        try:
+            ts_str = title.rsplit("_", 1)[-1]
+            created = datetime.strptime(ts_str, "%Y%m%d%H%M%S")
+        except (ValueError, IndexError):
+            continue
+        if (now - created) < timedelta(hours=max_age_hours):
+            continue
+        try:
+            ws = sh.worksheet(title)
+            sh.del_worksheet(ws)
+            removed += 1
+            print(f"[구글시트] 오래돼 방치된 임시 배치 탭을 정리했습니다: {title} "
+                  f"(생성 후 {(now - created).total_seconds() / 3600:.1f}시간 경과)")
+        except Exception as e:
+            print(f"[구글시트] '{title}' 임시 탭 삭제에 실패했습니다: {e}")
+    return removed
+
+
 def cleanup_old_week_tabs(sh, retention=GOOGLE_SHEET_WEEK_RETENTION):
     if sh is None:
         return 0
@@ -684,7 +837,17 @@ def append_new_rows_to_gsheet(local_sheet, ws, sync_state):
         if ws.row_count < needed_rows or ws.col_count < needed_cols:
             ws.resize(rows=max(ws.row_count, needed_rows), cols=max(ws.col_count, needed_cols))
 
-        ws.append_rows(new_values, value_input_option="RAW")
+        # table_range="A1"을 반드시 명시한다 (2026-09-12, 실제 데이터 밀림 사고로 추가).
+        # 지정하지 않으면 구글시트 API가 "어디부터 이어붙일지" 표 범위를 시트 안의
+        # 데이터를 보고 자동으로 추측하는데, 헤더 행이 A~S열까지 채우고 한참 떨어진
+        # AC열(29번째, 지분 물건 등기요약 칸)에도 값이 하나 있는 "듬성듬성한" 모양이라
+        # 이걸 두 개의 표로 오인해서 새로 추가하는 행을 엉뚱한 열부터 이어붙이는 사고가
+        # 실제로 발생했다 - 게다가 이 오작동이 자동저장(50건마다)마다 매번 다시
+        # 발생하면서 그 밀리는 정도가 계속 누적돼(예: 29열 -> 169열 -> 365열 -> 701열),
+        # 실행이 끝날 무렵엔 700열 넘게까지 밀려버렸다(사용자가 다운로드한 구글시트
+        # 사본에서 실제 확인됨). table_range="A1"로 "표는 A1부터 시작한다"고 못박아
+        # 두면 이 오작동 없이 항상 A열부터 정확히 이어붙는다.
+        ws.append_rows(new_values, value_input_option="RAW", table_range="A1")
         _apply_gsheet_formatting_range(ws, last_synced + 1, max_row, n_cols)
         sync_state["synced_rows"] = max_row
 
@@ -984,6 +1147,25 @@ def get_rows(driver):
 def get_first_tid(driver):
     rows = get_rows(driver)
     return rows[0].get_attribute("data-tid") if rows else None
+
+
+def get_total_count(driver, timeout=10):
+    """필터를 적용한 직후 화면에 표시되는 '(총 N건)'의 N을 읽어온다
+    (#totalCnt 요소, 예: '<span id="totalCnt" class="blue bold">8,310</span>').
+    사이트 자체가 "이 조건에 맞는 물건이 몇 개인지"를 알려주는 값이므로, 크롤링이
+    끝난 뒤 실제로 스캔/저장된 건수와 비교하는 기준값으로 쓴다 - 페이지를 못
+    넘겼거나 중간에 빠뜨린 물건이 있는지 가장 직접적으로 확인할 수 있는 방법이다.
+    값을 못 읽으면(요소가 없거나 숫자 형식이 아니면) None을 반환한다 - 이 확인이
+    실패해도 크롤링 자체의 진행에는 지장이 없어야 하므로 조용히 넘어간다."""
+    try:
+        el = WebDriverWait(driver, timeout).until(
+            EC.presence_of_element_located((By.ID, "totalCnt"))
+        )
+        text = (el.get_attribute("textContent") or el.text or "").strip()
+        return int(text.replace(",", ""))
+    except Exception as e:
+        print(f"[검증] 검색 결과 총 건수(#totalCnt)를 읽지 못했습니다: {e}")
+        return None
 
 
 def extract_row(row, tid, chk_no=None, tot_no=None):
@@ -1806,6 +1988,8 @@ def main():
     current_week_label = None
     run_start_remote_rows = None
     total_runs_so_far = None
+    batch_ws = None
+    batch_tab_name = None
     if GOOGLE_SHEETS_ENABLED:
         오늘_date = date.today()
         if is_scheduled_run:
@@ -1831,6 +2015,7 @@ def main():
             current_week_ws = get_or_create_tab(google_sh, current_week_label)
             if current_week_ws is not None:
                 ensure_header_row(current_week_ws)
+                repair_shifted_data_columns(current_week_ws)
                 run_start_remote_rows = _get_remote_row_count(current_week_ws)
                 total_runs_so_far = count_total_runs(google_sh)
                 if total_runs_so_far is not None:
@@ -1839,6 +2024,21 @@ def main():
                 if run_start_remote_rows is not None:
                     print(f"[검증] 이번 실행 시작 시점, 대상 탭('{current_week_label}')에는 "
                           f"이미 {run_start_remote_rows}행(헤더 포함)이 있습니다.")
+
+            # 오래되어 방치된(이전에 실행이 중간에 죽어서 정리 못 한) 임시 배치
+            # 탭들을 청소한다 - 지금 막 다른 실행이 만든 것은 12시간 미만이라
+            # 건드리지 않으므로 안전하다.
+            cleanup_orphaned_batch_tabs(google_sh)
+
+            # 이번 실행 전용 임시 배치 탭을 만든다 - 실행 도중의 모든 중간 저장은
+            # 공유 탭(current_week_ws)이 아니라 이 격리된 탭에만 이뤄지고, 실행이
+            # 끝나고 검증까지 통과한 뒤에야 공유 탭에 딱 한 번 안전하게 반영된다.
+            batch_tab_name = _batch_tab_name(current_week_label, 오늘)
+            batch_ws = get_or_create_tab(google_sh, batch_tab_name)
+            if batch_ws is not None:
+                ensure_header_row(batch_ws)
+                print(f"[구글시트] 이번 실행 전용 임시 배치 탭: {batch_tab_name} "
+                      f"(실행 도중 중간 저장은 전부 여기에만 쌓이고, 완료 후 공유 탭에 합쳐집니다)")
                 existing_case_numbers, existing_rows = load_existing_data_from_gsheet(current_week_ws)
 
     workbook = Workbook()
@@ -1883,6 +2083,9 @@ def main():
     scanned_case_numbers_pa = set()
     ca_scan_complete = False
     pa_scan_complete = False
+    ca_expected_total = None   # 사이트가 보여주는 type_a 검색 결과 총 건수
+    pa_expected_total = 0      # type_b 자산구분 9개 카테고리 총 건수 합계
+    pa_count_missing = False   # 카테고리 중 하나라도 총 건수를 못 읽었으면 True(합계 신뢰 불가)
 
     try:
         driver.get(BASE_URL)
@@ -1901,6 +2104,10 @@ def main():
 
             apply_filters(driver, apsl_amt_end_value)
             wait_for_list(driver)
+            ca_expected_total = get_total_count(driver)
+            if ca_expected_total is not None:
+                print(f"[검증] 사이트 기준 {TYPE_A_LABEL} 검색 결과 총 {ca_expected_total:,}건 확인 "
+                      f"(크롤링 완료 후 실제 수집/저장 건수와 비교합니다).")
             set_page_size(driver)
             wait_for_list(driver)
 
@@ -1976,7 +2183,7 @@ def main():
                             print(data)
                             append_row_with_format(sheet, data, 등기요약)
 
-                        maybe_autosave(sheet, current_week_ws, save_path, total_new_count, gsheet_sync_state)
+                        maybe_autosave(sheet, batch_ws, save_path, total_new_count, gsheet_sync_state)
                     except StaleElementReferenceException:
                         raise
                     except Exception as e:
@@ -2017,6 +2224,13 @@ def main():
                         print(f"\n[{TYPE_B_LABEL}] 자산구분 '{prptdvsn_label}' 검색 시작...")
                         apply_filters_pa(driver, apsl_amt_end_value, prptdvsn_value)
                         wait_for_list(driver)
+                        category_total = get_total_count(driver)
+                        if category_total is not None:
+                            pa_expected_total += category_total
+                            print(f"[검증] 사이트 기준 [{TYPE_B_LABEL}/{prptdvsn_label}] 총 "
+                                  f"{category_total:,}건 확인 (누적 {pa_expected_total:,}건).")
+                        else:
+                            pa_count_missing = True
                         set_page_size(driver)
                         wait_for_list(driver)
 
@@ -2092,7 +2306,7 @@ def main():
                                         print(data)
                                         append_row_with_format(sheet, data, 등기요약)
 
-                                    maybe_autosave(sheet, current_week_ws, save_path, total_new_count, gsheet_sync_state)
+                                    maybe_autosave(sheet, batch_ws, save_path, total_new_count, gsheet_sync_state)
                                 except StaleElementReferenceException:
                                     raise
                                 except Exception as e:
@@ -2112,6 +2326,7 @@ def main():
                     except Exception as e:
                         print(f"[{TYPE_B_LABEL}/{prptdvsn_label}] 이 카테고리 처리 중 오류가 발생해 건너뜁니다: {e}")
                         pa_all_categories_ok = False
+                        pa_count_missing = True
                         continue
 
                 print(f"\n{TYPE_B_LABEL} 물건 수집 완료 (전체 저장된 행 {sheet.max_row - 1}행).")
@@ -2124,6 +2339,69 @@ def main():
     except StaleElementReferenceException:
         print("페이지 갱신 중 요소 참조가 끊겼습니다. 지금까지 수집된 데이터로 저장합니다.")
     finally:
+        # --- 건수 검증: 사이트가 보여준 총 건수 vs 실제로 스캔/저장된 건수 비교 ---
+        # (2026-09-12 추가) "크롤링이 끝나면 실제 저장된 행 수가 사이트가 보여준
+        # 전체 검색 건수보다 최소한 같거나 많아야 한다"는 사용자 요청을 그대로
+        # 코드화했다. 한 물건이 "외 N필지"처럼 여러 필지로 나뉘면 여러 행으로
+        # 기록되므로, 정상적으로 전부 수집됐다면 행 수는 항상 물건 수 이상이어야
+        # 한다. 여기서는 두 단계로 나눠서 확인한다:
+        #   1) "스캔한 고유 물건 수"가 사이트의 총 건수와 정확히 같은지 - 페이지를
+        #      끝까지 빠짐없이 넘겼는지에 대한 가장 직접적인 확인.
+        #   2) "최종 저장된 행 수"가 사이트의 총 건수 이상인지 - 1번이 참이면
+        #      구조상 항상 참이어야 하지만(필지 분할은 행을 늘리기만 함), 혹시
+        #      모를 상황(저장 단계 문제 등)까지 이중으로 잡아내기 위해 별도로도
+        #      확인한다.
+        # 카테고리/페이지를 끝까지 못 돈 경우(ca_scan_complete/pa_scan_complete가
+        # False)는 애초에 사이트 총 건수와 비교할 수 없으므로(아직 다 안 봤으니까)
+        # 그 종류는 비교 자체를 건너뛴다.
+        count_check_notes = []
+        count_check_ok = True
+
+        def _count_rows_by_type(local_sheet, type_label):
+            cnt = 0
+            for row in local_sheet.iter_rows(min_row=2, values_only=True):
+                if row and row[0] == type_label:
+                    cnt += 1
+            return cnt
+
+        if ca_scan_complete and ca_expected_total is not None:
+            ca_unique_scanned = len(scanned_case_numbers_ca)
+            ca_rows_final = _count_rows_by_type(sheet, TYPE_A_LABEL)
+            print(f"\n[건수검증/{TYPE_A_LABEL}] 사이트 총 건수: {ca_expected_total:,} / "
+                  f"실제 스캔한 고유 물건 수: {ca_unique_scanned:,} / 최종 저장된 행 수: {ca_rows_final:,}")
+            if ca_unique_scanned < ca_expected_total:
+                count_check_ok = False
+                count_check_notes.append(
+                    f"{TYPE_A_LABEL} 스캔 건수 부족(사이트 {ca_expected_total:,} / 실제 {ca_unique_scanned:,})"
+                )
+            if ca_rows_final < ca_expected_total:
+                count_check_ok = False
+                count_check_notes.append(
+                    f"{TYPE_A_LABEL} 저장 행수 부족(사이트 {ca_expected_total:,} / 저장 {ca_rows_final:,})"
+                )
+
+        if pa_scan_complete and not pa_count_missing and pa_expected_total > 0:
+            pa_unique_scanned = len(scanned_case_numbers_pa)
+            pa_rows_final = _count_rows_by_type(sheet, TYPE_B_LABEL)
+            print(f"[건수검증/{TYPE_B_LABEL}] 사이트 총 건수(9개 자산구분 합): {pa_expected_total:,} / "
+                  f"실제 스캔한 고유 물건 수: {pa_unique_scanned:,} / 최종 저장된 행 수: {pa_rows_final:,}")
+            if pa_unique_scanned < pa_expected_total:
+                count_check_ok = False
+                count_check_notes.append(
+                    f"{TYPE_B_LABEL} 스캔 건수 부족(사이트 {pa_expected_total:,} / 실제 {pa_unique_scanned:,})"
+                )
+            if pa_rows_final < pa_expected_total:
+                count_check_ok = False
+                count_check_notes.append(
+                    f"{TYPE_B_LABEL} 저장 행수 부족(사이트 {pa_expected_total:,} / 저장 {pa_rows_final:,})"
+                )
+
+        if count_check_notes:
+            print("[건수검증] ⚠️ 문제 발견: " + " / ".join(count_check_notes))
+        elif ca_expected_total is not None or (pa_expected_total > 0 and not pa_count_missing):
+            print("[건수검증] ✅ 사이트 총 건수와 비교했을 때 누락 없이 정상적으로 수집됐습니다.")
+
+        verification_result = ""  # GOOGLE_SHEETS_ENABLED가 False인 경우에도 아래에서 안전하게 참조 가능하도록 기본값 설정
         if GOOGLE_SHEETS_ENABLED and current_week_ws is not None:
             sync_ok, remote_before_final, remote_after_final = sync_to_google_sheet(sheet, current_week_ws)
 
@@ -2140,6 +2418,29 @@ def main():
                 verification_result = "OK"
             else:
                 verification_result = f"불일치(예상{expected_rows}/실제{remote_after_final})"
+
+            if not count_check_ok:
+                verification_result += " / 건수검증실패: " + "; ".join(count_check_notes)
+
+            # --- 임시 배치 탭 정리 ---
+            # 최종 병합이 "OK"(예상한 그대로 정확히 반영됨)일 때만 이번 실행의
+            # 임시 배치 탭을 지운다. 그 외의 경우(저장실패/확인불가/불일치/건너뜀)는
+            # 혹시 몰라 지우지 않고 그대로 남겨둔다 - 공유 탭에 확실히 반영됐다는
+            # 확신이 없는 상태에서 유일한 사본(임시 탭)마저 지워버리면 정말로
+            # 데이터를 잃을 수 있기 때문이다. 남겨진 임시 탭은 나중에 사람이 직접
+            # 확인해서 수동으로 병합하거나, cleanup_orphaned_batch_tabs()가 12시간
+            # 뒤 자동으로 정리해준다(그 사이에 원인을 조사할 시간을 벌어준다).
+            if batch_ws is not None:
+                if verification_result == "OK":
+                    try:
+                        google_sh.del_worksheet(batch_ws)
+                        print(f"[구글시트] 임시 배치 탭을 정리했습니다 (공유 탭에 안전하게 반영 완료됨).")
+                    except Exception as e:
+                        print(f"[구글시트] 임시 배치 탭 삭제에 실패했습니다(치명적이지 않음): {e}")
+                else:
+                    print(f"[구글시트] 검증 결과가 '{verification_result}'라 임시 배치 탭을 "
+                          f"그대로 보존합니다({batch_tab_name}) - 데이터가 유실되지 않았으니 "
+                          f"필요하면 직접 확인해주세요.")
 
             # --- 실행 이력 한 줄 기록 ---
             if google_sh is not None:
@@ -2178,6 +2479,24 @@ def main():
               f"(신규 {total_new_count}건 추가, 기존 {total_skip_existing}건 건너뜀, "
               f"전체 저장된 행 {sheet.max_row - 1}건)")
         driver.quit()
+
+        # --- 이상 여부에 따라 GitHub Actions 실행 자체를 실패로 표시 ---
+        # (2026-09-12 추가) 지금까지는 데이터 손실 위험을 감지해도(검증 실패, 저장
+        # 오류 등) 콘솔에 경고만 남기고 파이썬 프로그램은 예외 없이 끝까지 실행됐다
+        # - 그러면 GitHub Actions는 이 실행을 "성공(초록 체크)"으로 표시하고, 알림
+        # 이메일도 안 간다. 사용자가 직접 로그를 열어보기 전까지는 문제가 있었는지
+        # 전혀 알 수 없었다("로컬은 됐는데 깃은 조용히 안 됐다"는 문제의 핵심 원인).
+        # 이제부터는 검증 결과가 "OK"나 "건너뜀(안전)"이 아니면(=실제로 뭔가 잘못됐을
+        # 가능성이 있으면) 일부러 0이 아닌 종료 코드로 끝내서 GitHub이 이 실행을
+        # "실패(빨간 X)"로 표시하게 만든다 - 저장소 Settings에서 실패 알림 이메일을
+        # 켜두셨다면(권장) 사람이 직접 로그를 열어보지 않아도 즉시 알 수 있다.
+        safe_results = {"OK", "건너뜀(원격이 이미 더 많음, 안전)", ""}
+        if GOOGLE_SHEETS_ENABLED and current_week_ws is not None and \
+                verification_result not in safe_results:
+            print(f"\n[종료 코드] 검증 결과가 '{verification_result}'로 안전하지 않아 "
+                  f"이번 실행을 실패로 표시합니다 (GitHub Actions에서 실패 알림이 발송되도록). "
+                  f"실제 데이터는 유실되지 않았을 수 있으나, 반드시 로그를 확인해주세요.")
+            sys.exit(1)
 
 
 if __name__ == "__main__":
