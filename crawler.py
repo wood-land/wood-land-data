@@ -73,6 +73,7 @@ GOOGLE_SHEETS_ENABLED = True
 GOOGLE_CREDENTIALS_PATH_CANDIDATES = []
 GOOGLE_SHEET_WEEK_RETENTION = 3
 AUTOSAVE_EVERY_N_ITEMS = 50
+MAX_RECOLLECT_ATTEMPTS = 2  # 사이트 총 건수보다 스캔 건수가 부족하면 최대 이만큼 다시 훑는다(1회차 포함)
 
 # --- GitHub Actions 환경변수 연동 (수집 범위/최저가격 상한/실행 트리거 종류) ---
 COLLECT_MODE_ENV = os.environ.get("COLLECT_MODE", "both")
@@ -2096,7 +2097,12 @@ def main():
             login(driver, login_id, login_pw)
             time.sleep(1)
 
-        if collect_mode in ("type_a", "both"):
+        ca_recollect_attempt = 0
+        while collect_mode in ("type_a", "both"):
+            ca_recollect_attempt += 1
+            driver.get(BASE_URL)
+            wait_for_list(driver)
+            time.sleep(1)
             share_tids_ca = set()
             if FETCH_DETAIL_DOCS:
                 print("\n[사전조회] '지분입찰 물건' 필터로 지분 물건 Tid만 먼저 수집합니다 (팝업 없음)...")
@@ -2201,8 +2207,21 @@ def main():
                 page_num = next_page
 
             ca_scan_complete = True
+            if ca_expected_total is None or len(scanned_case_numbers_ca) >= ca_expected_total:
+                break
+            if ca_recollect_attempt >= MAX_RECOLLECT_ATTEMPTS:
+                print(f"[검증] ⚠️ {TYPE_A_LABEL} 재시도 한도({MAX_RECOLLECT_ATTEMPTS}회)에 도달해 "
+                      f"더 이상 재시도하지 않고 지금까지 수집된 내용으로 진행합니다.")
+                break
+            print(f"\n[검증] {TYPE_A_LABEL} 스캔 건수({len(scanned_case_numbers_ca):,})가 사이트 총 "
+                  f"건수({ca_expected_total:,})보다 적어, 놓친 물건을 찾기 위해 목록을 처음부터 "
+                  f"다시 훑습니다 ({ca_recollect_attempt}/{MAX_RECOLLECT_ATTEMPTS}회차 재시도)...")
 
-        if collect_mode in ("type_b", "both"):
+        pa_recollect_attempt = 0
+        while collect_mode in ("type_b", "both"):
+            pa_recollect_attempt += 1
+            pa_expected_total = 0
+            pa_count_missing = False
             if collect_mode == "both":
                 print(f"\n{TYPE_A_LABEL} 물건 수집 완료 (총 {sheet.max_row - 1}행). {TYPE_B_LABEL} 물건 수집을 시작합니다...")
             else:
@@ -2333,6 +2352,17 @@ def main():
 
                 if pa_all_categories_ok:
                     pa_scan_complete = True
+
+            if pa_expected_total <= 0 or pa_count_missing or \
+                    len(scanned_case_numbers_pa) >= pa_expected_total:
+                break
+            if pa_recollect_attempt >= MAX_RECOLLECT_ATTEMPTS:
+                print(f"[검증] ⚠️ {TYPE_B_LABEL} 재시도 한도({MAX_RECOLLECT_ATTEMPTS}회)에 도달해 "
+                      f"더 이상 재시도하지 않고 지금까지 수집된 내용으로 진행합니다.")
+                break
+            print(f"\n[검증] {TYPE_B_LABEL} 스캔 건수({len(scanned_case_numbers_pa):,})가 사이트 총 "
+                  f"건수({pa_expected_total:,})보다 적어, 놓친 물건을 찾기 위해 목록을 처음부터 "
+                  f"다시 훑습니다 ({pa_recollect_attempt}/{MAX_RECOLLECT_ATTEMPTS}회차 재시도)...")
 
     except KeyboardInterrupt:
         print("사용자가 실행을 중지했습니다.")
