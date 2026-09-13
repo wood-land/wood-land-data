@@ -1102,16 +1102,30 @@ def collect_share_tids(driver, apsl_amt_end_value):
     share_tids = set()
     page_num = 1
     while page_num <= MAX_PAGES:
-        wait_for_list(driver)
-        time.sleep(0.3)
-        rows = get_rows(driver)
-        if not rows:
+        rows_present = False
+        page_tids = []
+        prev_first_tid = None
+        for attempt in range(3):
+            try:
+                wait_for_list(driver)
+                time.sleep(0.3)
+                rows = get_rows(driver)
+                if not rows:
+                    break
+                rows_present = True
+                prev_first_tid = rows[0].get_attribute("data-tid")
+                page_tids = [row.get_attribute("data-tid") for row in rows]
+                page_tids = [tid for tid in page_tids if tid]
+                break
+            except StaleElementReferenceException:
+                if attempt == 2:
+                    raise
+                print(f"[사전조회] {page_num} 페이지에서 목록 참조가 끊겨 재시도합니다 ({attempt + 1}/3)...")
+                time.sleep(1.0)
+
+        if not rows_present:
             break
-        prev_first_tid = rows[0].get_attribute("data-tid")
-        for row in rows:
-            tid = row.get_attribute("data-tid")
-            if tid:
-                share_tids.add(tid)
+        share_tids.update(page_tids)
         next_page = page_num + 1
         if not go_to_page(driver, next_page, prev_first_tid):
             break
@@ -1139,7 +1153,7 @@ def apply_filters_pa(driver, apsl_amt_end_value, prptdvsn_value):
 
 
 def wait_for_list(driver, timeout=15):
-    WebDriverWait(driver, timeout).until(
+    WebDriverWait(driver, timeout, ignored_exceptions=(StaleElementReferenceException,)).until(
         EC.presence_of_element_located((By.ID, "lsTbody"))
     )
 
@@ -1963,7 +1977,9 @@ def go_to_page(driver, target_page, prev_first_tid):
             return False
 
     try:
-        WebDriverWait(driver, 15).until(lambda d: get_first_tid(d) != prev_first_tid)
+        WebDriverWait(
+            driver, 15, ignored_exceptions=(StaleElementReferenceException,)
+        ).until(lambda d: get_first_tid(d) != prev_first_tid)
     except TimeoutException:
         print(f"경고: {target_page} 페이지로 이동 후 목록 변경을 확인하지 못했습니다.")
     return True
