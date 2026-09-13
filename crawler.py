@@ -2194,7 +2194,17 @@ def main():
 
                         maybe_autosave(sheet, batch_ws, save_path, total_new_count, gsheet_sync_state)
                     except StaleElementReferenceException:
-                        raise
+                        # (2026-09-13 수정) 예전에는 이 예외를 그대로 다시 던져서
+                        # (raise) 페이지 루프/재시도 루프/main() 전체를 통째로
+                        # 중단시켰다 - 실제로 물건 1건만 처리한 채로 전체 실행이
+                        # 끝나버리는 사고가 있었다. 물건 하나 처리 중 DOM 요소
+                        # 참조가 끊긴 것은 페이지가 그 사이 살짝 갱신됐다는 뜻일
+                        # 뿐이라, 다른 오류들과 마찬가지로 "이 물건만 건너뛰고
+                        # 계속 진행"하는 편이 훨씬 안전하다 - 이미 있는 재시도
+                        # 루프(스캔 건수 부족 시 재수집)가 놓친 물건을 나중에
+                        # 다시 채워준다.
+                        print(f"[tid={tid}] 페이지 요소 참조가 끊겨 이 물건을 건너뜁니다.")
+                        continue
                     except Exception as e:
                         print(f"[tid={tid}] 이 물건 처리 중 오류가 발생해 건너뜁니다: {e}")
                         continue
@@ -2330,7 +2340,9 @@ def main():
 
                                     maybe_autosave(sheet, batch_ws, save_path, total_new_count, gsheet_sync_state)
                                 except StaleElementReferenceException:
-                                    raise
+                                    print(f"[{TYPE_B_LABEL}/{prptdvsn_label}][tid={tid}] 페이지 요소 참조가 "
+                                          f"끊겨 이 물건을 건너뜁니다.")
+                                    continue
                                 except Exception as e:
                                     print(f"[{TYPE_B_LABEL}/{prptdvsn_label}][tid={tid}] 이 물건 처리 중 오류가 발생해 건너뜁니다: {e}")
                                     continue
