@@ -904,10 +904,13 @@ def prompt_collect_mode():
 
 
 def prompt_apsl_amt_end():
-    """GitHub Actions 환경변수 APSL_AMT_END(원 단위)로 대체"""
+    """GitHub Actions 환경변수 APSL_AMT_END(원 단위, 워크플로우 입력 이름은 하위
+    호환을 위해 그대로 유지되지만 내부적으로는 MINB_AMT_END_ENV 변수에 담겨있음)로 대체.
+    (참고: 값을 읽는 변수 이름이 MINB_AMT_END_ENV로 바뀌었는데 이 함수 안의 참조를
+    같이 안 고쳐서 NameError로 크래시하던 버그를 수정함 - 2026-09-13)"""
     label_map = {label: val for val, label in AMOUNT_OPTIONS}
     valid_values = {val for val, _ in AMOUNT_OPTIONS}
-    raw = APSL_AMT_END_ENV.strip()
+    raw = MINB_AMT_END_ENV.strip()
     if raw in label_map:
         result = str(label_map[raw])
     elif raw.isdigit() and int(raw) in valid_values:
