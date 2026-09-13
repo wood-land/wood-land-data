@@ -71,7 +71,7 @@ CURRENCY_COLUMNS = (6, 9, 10)
 
 GOOGLE_SHEETS_ENABLED = True
 GOOGLE_CREDENTIALS_PATH_CANDIDATES = []
-GOOGLE_SHEET_WEEK_RETENTION = 3
+GOOGLE_SHEET_WEEK_RETENTION = 1  # 이번 주 탭만 남기고 지난 주차는 자동 삭제(과거 데이터 불필요)
 AUTOSAVE_EVERY_N_ITEMS = 50
 MAX_RECOLLECT_ATTEMPTS = 2  # 사이트 총 건수보다 스캔 건수가 부족하면 최대 이만큼 다시 훑는다(1회차 포함)
 
@@ -683,6 +683,36 @@ def cleanup_old_week_tabs(sh, retention=GOOGLE_SHEET_WEEK_RETENTION):
             sh.del_worksheet(ws)
             removed += 1
             print(f"[구글시트] 보관 기간({retention}주)이 지난 오래된 주차 탭을 삭제했습니다: {title}")
+        except Exception as e:
+            print(f"[구글시트] '{title}' 탭 삭제에 실패했습니다: {e}")
+    return removed
+
+
+MANUAL_TAB_PATTERN = re.compile(r"^\d{8}_manual_data$")
+GOOGLE_SHEET_MANUAL_RETENTION = 1  # 수동 실행 탭도 최신 것만 남기고 자동 삭제(과거 데이터 불필요)
+
+
+def cleanup_old_manual_tabs(sh, retention=GOOGLE_SHEET_MANUAL_RETENTION):
+    if sh is None:
+        return 0
+    try:
+        titles = [ws.title for ws in sh.worksheets()]
+    except Exception as e:
+        print(f"[구글시트] 탭 목록을 가져오는 데 실패해 오래된 수동 실행 탭 정리를 건너뜁니다: {e}")
+        return 0
+
+    manual_titles = sorted({t for t in titles if MANUAL_TAB_PATTERN.match(t)}, reverse=True)
+    to_delete = [t for t in manual_titles if t not in manual_titles[:retention]]
+    if not to_delete:
+        return 0
+
+    removed = 0
+    for title in to_delete:
+        try:
+            ws = sh.worksheet(title)
+            sh.del_worksheet(ws)
+            removed += 1
+            print(f"[구글시트] 보관 기간이 지난 오래된 수동 실행 탭을 삭제했습니다: {title}")
         except Exception as e:
             print(f"[구글시트] '{title}' 탭 삭제에 실패했습니다: {e}")
     return removed
@@ -2529,11 +2559,13 @@ def main():
                           f"물건 {sold_out_total}건(매각완료 등으로 추정, {TYPE_A_LABEL} {len(sold_out_ca)}건 / "
                           f"{TYPE_B_LABEL} {len(sold_out_pa)}건)이 있습니다.")
 
-            # 오래된 탭 자동 정리도 예약 실행일 때만 수행한다 - 수동 실행(수동 전용
-            # 탭 이름 패턴이라 어차피 WEEK_TAB_PATTERN에 안 걸려 청소 대상이 되지도
-            # 않지만) 도중에 매번 정리 API 호출까지 할 필요는 없으므로 함께 건너뛴다.
+            # 오래된 탭 자동 정리 - 트리거 종류별로 자기 몫의 탭만 정리한다(예약
+            # 실행은 예약 전용 주차 탭을, 수동 실행은 수동 전용 탭을). 과거 데이터는
+            # 필요 없다는 방침에 따라 둘 다 보관 기간을 최소로 유지한다.
             if is_scheduled_run and google_sh is not None:
                 cleanup_old_week_tabs(google_sh, GOOGLE_SHEET_WEEK_RETENTION)
+            elif not is_scheduled_run and google_sh is not None:
+                cleanup_old_manual_tabs(google_sh, GOOGLE_SHEET_MANUAL_RETENTION)
 
         workbook.save(save_path)
         print(f"Excel 파일 저장 완료: {save_path} "
