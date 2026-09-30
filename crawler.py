@@ -74,6 +74,28 @@ GOOGLE_CREDENTIALS_PATH_CANDIDATES = []
 GOOGLE_SHEET_WEEK_RETENTION = 1  # 이번 주 탭만 남기고 지난 주차는 자동 삭제(과거 데이터 불필요)
 AUTOSAVE_EVERY_N_ITEMS = 50
 MAX_RECOLLECT_ATTEMPTS = 2  # 사이트 총 건수보다 스캔 건수가 부족하면 최대 이만큼 다시 훑는다(1회차 포함)
+# (2026-09-30 추가) 한 페이지 안의 행이 "전부" StaleElementReferenceException으로 실패하면
+# (페이지 전환 타이밍 문제로 실제 사례 확인됨 - 2026-09-25/26 실행에서 7,383건 중 1,972건만
+# 스캔한 채 조기 종료) "마지막 페이지"가 아니라 "일시적 오류"로 보고 같은 페이지를 다시 읽는다.
+# 이 재시도 한도를 넘기면 그때는 정말로 끝난 것으로 보고 다음 단계로 넘어간다.
+PAGE_STALE_RETRY_LIMIT = 3
+
+# (2026-09-19) 워크플로우 timeout-minutes에 걸려 "실행" 단계가 강제 취소되면 main()의 finally
+# (=임시 배치 탭 -> 공유 주차 탭 병합)까지 도달하지 못해 그 실행의 데이터가 임시 배치 탭에만
+# 남고, 12시간 뒤 다음 실행이 그 탭을 방치 탭으로 보고 삭제해버리는 사고가 있었다(금요일 데이터
+# 소실의 원인). 그래서 워크플로우 timeout보다 충분히 일찍 스스로 수집을 멈추고 정상적으로
+# 병합 단계까지 가도록 마감 시각을 둔다. 0이면 마감 없음(로컬 실행용).
+RUN_DEADLINE_MINUTES = float(os.environ.get("RUN_DEADLINE_MINUTES", "0") or 0)
+_RUN_START_MONOTONIC = time.monotonic()
+
+
+class RunDeadlineReached(BaseException):
+    """수집 마감 시각 도달. BaseException이라 물건 단위 `except Exception`에 삼켜지지 않는다."""
+
+
+def check_run_deadline():
+    if RUN_DEADLINE_MINUTES > 0 and (time.monotonic() - _RUN_START_MONOTONIC) / 60 >= RUN_DEADLINE_MINUTES:
+        raise RunDeadlineReached()
 
 # --- GitHub Actions 환경변수 연동 (수집 범위/최저가격 상한/실행 트리거 종류) ---
 COLLECT_MODE_ENV = os.environ.get("COLLECT_MODE", "both")
@@ -625,12 +647,89 @@ def _batch_tab_name(week_label, run_start_dt):
 BATCH_TAB_PATTERN = re.compile(r"^_batch_.+_\d{14}$")
 
 
+def merge_orphaned_batch_tabs(sh, week_ws, week_label, max_age_hours=12):
+    """이전 실행이 타임아웃/강제 취소로 병합 단계에 못 가 임시 배치 탭에만 남은 데이터를
+    이번 주 공유 탭(week_ws)으로 옮긴 뒤 그 임시 탭을 삭제한다 (2026-09-19 추가).
+
+    예전에는 12시간 지난 임시 탭을 내용 확인 없이 그냥 지웠기 때문에, 5시간 타임아웃으로
+    병합 못 한 금요일 실행의 데이터가 토요일 실행 시작 시점에 통째로 삭제됐다.
+    - 이름이 "_batch_<이번 주 탭 이름>_<시각>" 인 것만 대상으로 한다(다른 주 것은 건드리지 않음).
+    - 공유 탭에 이미 있는 사건번호의 행은 건너뛰고, 없는 것만 A1 기준으로 append한다.
+    - append가 성공한 경우에만 임시 탭을 삭제한다. 실패하면 그대로 남겨둔다."""
+    if sh is None or week_ws is None:
+        return 0
+    try:
+        titles = [ws.title for ws in sh.worksheets()]
+    except Exception as e:
+        print(f"[구글시트] 탭 목록을 가져오지 못해 미병합 임시 탭 복구를 건너뜁니다: {e}")
+        return 0
+
+    now = datetime.utcnow() + timedelta(hours=9)
+    orphans = []
+    for title in titles:
+        if not BATCH_TAB_PATTERN.match(title):
+            continue
+        body, ts_str = title[len(BATCH_TAB_PREFIX):].rsplit("_", 1)
+        if body != week_label:
+            continue
+        try:
+            created = datetime.strptime(ts_str, "%Y%m%d%H%M%S")
+        except ValueError:
+            continue
+        if (now - created) < timedelta(hours=max_age_hours):
+            continue  # 지금 진행 중인 다른 실행의 탭일 수 있음
+        orphans.append(title)
+    if not orphans:
+        return 0
+
+    try:
+        week_values = week_ws.get_all_values()
+    except Exception as e:
+        print(f"[구글시트] 공유 탭을 읽지 못해 미병합 임시 탭 복구를 건너뜁니다: {e}")
+        return 0
+    if not week_values or "사건번호" not in week_values[0]:
+        return 0
+    sano_i = week_values[0].index("사건번호")
+    known = {(r[sano_i] or "").strip() for r in week_values[1:] if sano_i < len(r)}
+
+    merged_tabs = 0
+    for title in sorted(orphans):
+        try:
+            bws = sh.worksheet(title)
+            bvalues = bws.get_all_values()
+            if not bvalues or "사건번호" not in bvalues[0]:
+                continue
+            b_sano_i = bvalues[0].index("사건번호")
+            to_add = []
+            for r in bvalues[1:]:
+                key = (r[b_sano_i] or "").strip() if b_sano_i < len(r) else ""
+                if key and key not in known:
+                    to_add.append(r)
+            if to_add:
+                needed_rows = len(week_values) + len(to_add) + 10
+                if week_ws.row_count < needed_rows:
+                    week_ws.resize(rows=needed_rows)
+                week_ws.append_rows(to_add, value_input_option="RAW", table_range="A1")
+                for r in to_add:
+                    known.add((r[b_sano_i] or "").strip())
+                week_values.extend(to_add)
+            print(f"[구글시트] 미병합 임시 탭 '{title}'의 데이터 {len(to_add)}행을 "
+                  f"공유 탭 '{week_label}'에 병합했습니다.")
+            sh.del_worksheet(bws)
+            merged_tabs += 1
+        except Exception as e:
+            print(f"[구글시트] 임시 탭 '{title}' 병합 실패 - 데이터 보존을 위해 삭제하지 않습니다: {e}")
+    return merged_tabs
+
+
 def cleanup_orphaned_batch_tabs(sh, max_age_hours=12):
     """실행이 중간에 죽어서(강제 종료 등) 끝까지 못 가 미처 정리되지 못하고 남은
     오래된 임시 배치 탭을 청소한다. 이름에 박힌 실행 시작 시각을 파싱해서
     max_age_hours시간보다 오래된 것만 지운다 - 지금 막 다른 실행이 만들어서
     한창 쓰고 있는 임시 탭까지 실수로 지우지 않기 위한 안전장치다(정상적인
-    실행은 보통 5시간 이내에 끝나므로 12시간이면 충분히 안전한 여유)."""
+    실행은 보통 5시간 이내에 끝나므로 12시간이면 충분히 안전한 여유).
+    (2026-09-19) 데이터 행이 남아있는 탭은 지우지 않는다 - 병합 안 된 데이터일 수
+    있으므로 merge_orphaned_batch_tabs()가 처리하거나 사람이 확인해야 한다."""
     if sh is None:
         return 0
     try:
@@ -653,6 +752,9 @@ def cleanup_orphaned_batch_tabs(sh, max_age_hours=12):
             continue
         try:
             ws = sh.worksheet(title)
+            if len(ws.get_all_values()) > 1:
+                print(f"[구글시트] 오래된 임시 배치 탭 '{title}'에 데이터가 남아있어 삭제하지 않고 보존합니다.")
+                continue
             sh.del_worksheet(ws)
             removed += 1
             print(f"[구글시트] 오래돼 방치된 임시 배치 탭을 정리했습니다: {title} "
@@ -2066,6 +2168,7 @@ def main():
             if current_week_ws is not None:
                 ensure_header_row(current_week_ws)
                 repair_shifted_data_columns(current_week_ws)
+                merge_orphaned_batch_tabs(google_sh, current_week_ws, current_week_label)
                 run_start_remote_rows = _get_remote_row_count(current_week_ws)
                 total_runs_so_far = count_total_runs(google_sh)
                 if total_runs_so_far is not None:
@@ -2170,6 +2273,7 @@ def main():
                 doc_session = build_requests_session(driver)
 
             page_num = 1
+            page_stale_retry = 0
             while page_num <= MAX_PAGES:
                 print(f"현재 {page_num} 페이지 데이터 추출 중...")
                 wait_for_list(driver)
@@ -2183,7 +2287,9 @@ def main():
                 prev_first_tid = rows[0].get_attribute("data-tid")
                 tot_no = len(rows)
                 page_extracted_count = 0
+                page_stale_count = 0
                 for chk_no, row in enumerate(rows, start=1):
+                    check_run_deadline()
                     tid = None
                     try:
                         tid = row.get_attribute("data-tid")
@@ -2250,10 +2356,24 @@ def main():
                         # 루프(스캔 건수 부족 시 재수집)가 놓친 물건을 나중에
                         # 다시 채워준다.
                         print(f"[tid={tid}] 페이지 요소 참조가 끊겨 이 물건을 건너뜁니다.")
+                        page_stale_count += 1
                         continue
                     except Exception as e:
                         print(f"[tid={tid}] 이 물건 처리 중 오류가 발생해 건너뜁니다: {e}")
                         continue
+
+                # (2026-09-30) 행이 있었는데(tot_no>0) 전부 stale로 실패한 경우는 "마지막
+                # 페이지"가 아니라 일시적 오류일 가능성이 높다 - 같은 페이지를 다시 읽는다
+                # (페이지를 넘기지 않음). 진짜로 데이터가 없는 마지막 페이지는 위에서 이미
+                # `if not rows` 로 걸러진다.
+                if page_extracted_count == 0 and page_stale_count >= tot_no > 0 and \
+                        page_stale_retry < PAGE_STALE_RETRY_LIMIT:
+                    page_stale_retry += 1
+                    print(f"[재시도] {page_num} 페이지의 항목이 전부 일시적 오류(stale)로 추출 실패해 "
+                          f"같은 페이지를 다시 읽습니다 ({page_stale_retry}/{PAGE_STALE_RETRY_LIMIT}회차)...")
+                    time.sleep(1.5)
+                    continue
+                page_stale_retry = 0
 
                 if page_extracted_count == 0 and page_num > 1:
                     print("이 페이지에서 추출된 데이터가 없어 종료합니다.")
@@ -2313,6 +2433,7 @@ def main():
                         wait_for_list(driver)
 
                         pa_page_num = 1
+                        pa_page_stale_retry = 0
                         while pa_page_num <= MAX_PAGES:
                             print(f"[{TYPE_B_LABEL}/{prptdvsn_label}] 현재 {pa_page_num} 페이지 데이터 추출 중...")
                             wait_for_list(driver)
@@ -2326,7 +2447,9 @@ def main():
                             prev_first_tid_pa = rows[0].get_attribute("data-tid")
                             tot_no = len(rows)
                             page_extracted_count = 0
+                            page_stale_count = 0
                             for chk_no, row in enumerate(rows, start=1):
+                                check_run_deadline()
                                 tid = None
                                 try:
                                     tid = row.get_attribute("data-tid")
@@ -2388,10 +2511,21 @@ def main():
                                 except StaleElementReferenceException:
                                     print(f"[{TYPE_B_LABEL}/{prptdvsn_label}][tid={tid}] 페이지 요소 참조가 "
                                           f"끊겨 이 물건을 건너뜁니다.")
+                                    page_stale_count += 1
                                     continue
                                 except Exception as e:
                                     print(f"[{TYPE_B_LABEL}/{prptdvsn_label}][tid={tid}] 이 물건 처리 중 오류가 발생해 건너뜁니다: {e}")
                                     continue
+
+                            if page_extracted_count == 0 and page_stale_count >= tot_no > 0 and \
+                                    pa_page_stale_retry < PAGE_STALE_RETRY_LIMIT:
+                                pa_page_stale_retry += 1
+                                print(f"[재시도][{TYPE_B_LABEL}/{prptdvsn_label}] {pa_page_num} 페이지의 항목이 "
+                                      f"전부 일시적 오류(stale)로 추출 실패해 같은 페이지를 다시 읽습니다 "
+                                      f"({pa_page_stale_retry}/{PAGE_STALE_RETRY_LIMIT}회차)...")
+                                time.sleep(1.5)
+                                continue
+                            pa_page_stale_retry = 0
 
                             if page_extracted_count == 0 and pa_page_num > 1:
                                 print(f"[{TYPE_B_LABEL}/{prptdvsn_label}] 이 페이지에서 추출된 데이터가 없어 이 카테고리 수집을 종료합니다.")
@@ -2427,6 +2561,9 @@ def main():
 
     except KeyboardInterrupt:
         print("사용자가 실행을 중지했습니다.")
+    except RunDeadlineReached:
+        print(f"\n[마감] 실행 시간이 {RUN_DEADLINE_MINUTES:g}분에 도달해 수집을 여기서 멈추고, "
+              f"지금까지 모은 데이터를 공유 탭에 병합합니다.")
     except StaleElementReferenceException:
         print("페이지 갱신 중 요소 참조가 끊겼습니다. 지금까지 수집된 데이터로 저장합니다.")
     finally:

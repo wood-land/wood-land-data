@@ -25,7 +25,7 @@ on:
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    timeout-minutes: 300  # 5시간
+    timeout-minutes: 350  # GitHub 최대(360분)에 가깝게. crawler.py가 RUN_DEADLINE_MINUTES에 스스로 멈춰 병합까지 마치도록 여유를 둔다
     concurrency:
       # 이 워크플로우가 동시에 두 번 실행되는 것을 막는다(예약 실행끼리 GitHub 자체의
       # 지연으로 겹치는 경우 대비). group을 고정해두면 이미 실행 중인 작업이 있을 때
@@ -88,6 +88,9 @@ jobs:
           # 했는지를 그대로 넘겨준다 - crawler.py가 이 값으로 예약 전용 탭을 쓸지,
           # 수동 실행 전용(실행일자 기준) 탭을 쓸지 결정한다.
           TRIGGER_TYPE: ${{ github.event_name }}
+          # 타임아웃(350분)에 강제 취소되면 임시 탭 -> 공유 탭 병합이 실행되지 못하므로,
+          # 그보다 30분 일찍 수집을 멈추고 병합 단계로 넘어가게 한다.
+          RUN_DEADLINE_MINUTES: "320"
         run: python crawler.py
 
       - name: 결과 파일을 실행 기록에 첨부 (백업용)
