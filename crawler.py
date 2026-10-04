@@ -2251,6 +2251,9 @@ def main():
 
     driver = get_driver()
     seen_tids = set()
+    # (2026-10-04) 재수집 회차가 바뀌어도 이미 처리한 tid는 기억한다. 예전에는 회차마다 초기화돼서
+    # 재수집 때 이미 저장한 공매 물건을 처음부터 다시 저장했다(같은 물건이 2번씩 저장되던 원인).
+    seen_tids_pa = set()
     doc_session = None
     total_new_count = 0
     total_skip_existing = 0
@@ -2418,14 +2421,11 @@ def main():
                 print(f"[검증] ⚠️ {TYPE_A_LABEL} 재시도 한도({MAX_RECOLLECT_ATTEMPTS}회)에 도달해 "
                       f"더 이상 재시도하지 않고 지금까지 수집된 내용으로 진행합니다.")
                 break
-            print(f"\n[검증] {TYPE_A_LABEL} 스캔 건수({len(scanned_case_numbers_ca):,})가 사이트 총 "
+            print(f"\n[검증] {TYPE_A_LABEL} 스캔 건수({len(seen_tids):,})가 사이트 총 "
                   f"건수({ca_expected_total:,})보다 적어, 놓친 물건을 찾기 위해 목록을 처음부터 "
                   f"다시 훑습니다 ({ca_recollect_attempt}/{MAX_RECOLLECT_ATTEMPTS}회차 재시도)...")
 
         pa_recollect_attempt = 0
-        # (2026-10-04) 재수집 회차가 바뀌어도 이미 처리한 tid는 기억한다. 예전에는 회차마다 초기화돼서
-        # 재수집 때 이미 저장한 공매 물건을 처음부터 다시 저장했다(같은 물건이 2번씩 저장되던 원인).
-        seen_tids_pa = set()
         while collect_mode in ("type_b", "both"):
             pa_recollect_attempt += 1
             pa_expected_total = 0
@@ -2586,7 +2586,7 @@ def main():
                 print(f"[검증] ⚠️ {TYPE_B_LABEL} 재시도 한도({MAX_RECOLLECT_ATTEMPTS}회)에 도달해 "
                       f"더 이상 재시도하지 않고 지금까지 수집된 내용으로 진행합니다.")
                 break
-            print(f"\n[검증] {TYPE_B_LABEL} 스캔 건수({len(scanned_case_numbers_pa):,})가 사이트 총 "
+            print(f"\n[검증] {TYPE_B_LABEL} 스캔 건수({len(seen_tids_pa):,})가 사이트 총 "
                   f"건수({pa_expected_total:,})보다 적어, 놓친 물건을 찾기 위해 목록을 처음부터 "
                   f"다시 훑습니다 ({pa_recollect_attempt}/{MAX_RECOLLECT_ATTEMPTS}회차 재시도)...")
 
@@ -2624,10 +2624,13 @@ def main():
             return cnt
 
         if ca_scan_complete and ca_expected_total is not None:
-            ca_unique_scanned = len(scanned_case_numbers_ca)
+            # (2026-10-04) 사이트 총 건수는 tid(물건) 단위다. 한 사건번호에 물건이 여러 개 걸린 경우가
+            # 많아(실제 7,482건 중 사건번호 7,079개) 사건번호 개수와 비교하면 누락이 없어도 "스캔
+            # 건수 부족"으로 오판해 실행이 실패 처리됐다. 그래서 처리한 tid 개수로 비교한다.
+            ca_unique_scanned = len(seen_tids)
             ca_rows_final = _count_rows_by_type(sheet, TYPE_A_LABEL)
             print(f"\n[건수검증/{TYPE_A_LABEL}] 사이트 총 건수: {ca_expected_total:,} / "
-                  f"실제 스캔한 고유 물건 수: {ca_unique_scanned:,} / 최종 저장된 행 수: {ca_rows_final:,}")
+                  f"실제 스캔한 물건(tid) 수: {ca_unique_scanned:,} / 최종 저장된 행 수: {ca_rows_final:,}")
             if ca_unique_scanned < ca_expected_total:
                 count_check_ok = False
                 count_check_notes.append(
@@ -2640,10 +2643,10 @@ def main():
                 )
 
         if pa_scan_complete and not pa_count_missing and pa_expected_total > 0:
-            pa_unique_scanned = len(scanned_case_numbers_pa)
+            pa_unique_scanned = len(seen_tids_pa)
             pa_rows_final = _count_rows_by_type(sheet, TYPE_B_LABEL)
             print(f"[건수검증/{TYPE_B_LABEL}] 사이트 총 건수(9개 자산구분 합): {pa_expected_total:,} / "
-                  f"실제 스캔한 고유 물건 수: {pa_unique_scanned:,} / 최종 저장된 행 수: {pa_rows_final:,}")
+                  f"실제 스캔한 물건(tid) 수: {pa_unique_scanned:,} / 최종 저장된 행 수: {pa_rows_final:,}")
             if pa_unique_scanned < pa_expected_total:
                 count_check_ok = False
                 count_check_notes.append(
