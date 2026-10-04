@@ -169,7 +169,30 @@ AMOUNT_OPTIONS = [
 DEFAULT_APSL_AMT_END = 500000000
 
 
-def append_row_with_format(sheet, row_values, ac_value=None):
+# (2026-10-04) 같은 물건이 2번씩 저장되는 문제 방지: 이번 실행에서 이미 시트에 기록한(또는 구글 시트에서
+# 불러온 기존) 행의 키를 기억해두고, 같은 키의 행은 다시 쓰지 않는다. 키에 chkNo(페이지 내 순번)는
+# 넣지 않는다 - 재수집 때는 같은 물건이라도 순번이 달라질 수 있기 때문이다.
+_WRITTEN_ROW_KEYS = set()
+
+
+def _tid_from_url(url):
+    m = re.search(r"(?:tid|cltrNo)=(\d+)", str(url or ""))
+    return m.group(1) if m else ""
+
+
+def _row_dup_key(row_values):
+    def _cell(i):
+        return re.sub(r"\s+", " ", str(row_values[i] if i < len(row_values) and row_values[i] is not None else "")).strip()
+    return (_cell(0), _cell(1), _tid_from_url(_cell(11)), _cell(14))
+
+
+def append_row_with_format(sheet, row_values, ac_value=None, dedupe=True):
+    """행을 추가한다. dedupe=True(기본)이고 같은 키의 행이 이미 있으면 추가하지 않고 None을 반환한다.
+    기존 시트 내용을 그대로 옮겨 담을 때는 dedupe=False로 호출한다(키만 등록됨)."""
+    key = _row_dup_key(row_values)
+    if dedupe and key in _WRITTEN_ROW_KEYS:
+        return None
+    _WRITTEN_ROW_KEYS.add(key)
     sheet.append(row_values)
     r = sheet.max_row
     for col in CURRENCY_COLUMNS:
@@ -2212,7 +2235,7 @@ def main():
         save_path = f"{base}_A{ext}"
 
     for row_values, ac_value in existing_rows:
-        append_row_with_format(sheet, row_values, ac_value)
+        append_row_with_format(sheet, row_values, ac_value, dedupe=False)
     if existing_rows:
         기존_출처 = f"이번 주 구글 시트 탭({current_week_label})" if GOOGLE_SHEETS_ENABLED else "이전 파일"
         print(f"{기존_출처}에서 기존 물건 {len(existing_rows)}건을 가져왔습니다 "
@@ -2298,6 +2321,7 @@ def main():
                         seen_tids.add(tid)
                         data = extract_row(row, tid, chk_no=chk_no, tot_no=tot_no)
                         if not data:
+                            seen_tids.discard(tid)
                             continue
                         page_extracted_count += 1
 
@@ -2355,10 +2379,12 @@ def main():
                         # 계속 진행"하는 편이 훨씬 안전하다 - 이미 있는 재시도
                         # 루프(스캔 건수 부족 시 재수집)가 놓친 물건을 나중에
                         # 다시 채워준다.
+                        seen_tids.discard(tid)
                         print(f"[tid={tid}] 페이지 요소 참조가 끊겨 이 물건을 건너뜁니다.")
                         page_stale_count += 1
                         continue
                     except Exception as e:
+                        seen_tids.discard(tid)
                         print(f"[tid={tid}] 이 물건 처리 중 오류가 발생해 건너뜁니다: {e}")
                         continue
 
@@ -2386,7 +2412,7 @@ def main():
                 page_num = next_page
 
             ca_scan_complete = True
-            if ca_expected_total is None or len(scanned_case_numbers_ca) >= ca_expected_total:
+            if ca_expected_total is None or len(seen_tids) >= ca_expected_total:
                 break
             if ca_recollect_attempt >= MAX_RECOLLECT_ATTEMPTS:
                 print(f"[검증] ⚠️ {TYPE_A_LABEL} 재시도 한도({MAX_RECOLLECT_ATTEMPTS}회)에 도달해 "
@@ -2397,6 +2423,9 @@ def main():
                   f"다시 훑습니다 ({ca_recollect_attempt}/{MAX_RECOLLECT_ATTEMPTS}회차 재시도)...")
 
         pa_recollect_attempt = 0
+        # (2026-10-04) 재수집 회차가 바뀌어도 이미 처리한 tid는 기억한다. 예전에는 회차마다 초기화돼서
+        # 재수집 때 이미 저장한 공매 물건을 처음부터 다시 저장했다(같은 물건이 2번씩 저장되던 원인).
+        seen_tids_pa = set()
         while collect_mode in ("type_b", "both"):
             pa_recollect_attempt += 1
             pa_expected_total = 0
@@ -2405,7 +2434,6 @@ def main():
                 print(f"\n{TYPE_A_LABEL} 물건 수집 완료 (총 {sheet.max_row - 1}행). {TYPE_B_LABEL} 물건 수집을 시작합니다...")
             else:
                 print(f"\n{TYPE_B_LABEL} 물건 수집을 시작합니다...")
-            seen_tids_pa = set()
             pa_list_ok = True
             try:
                 driver.get(PA_BASE_URL)
@@ -2458,6 +2486,7 @@ def main():
                                     seen_tids_pa.add(tid)
                                     data = extract_row_pa(row, tid, chk_no=chk_no, tot_no=tot_no)
                                     if not data:
+                                        seen_tids_pa.discard(tid)
                                         continue
                                     page_extracted_count += 1
 
@@ -2509,11 +2538,13 @@ def main():
 
                                     maybe_autosave(sheet, batch_ws, save_path, total_new_count, gsheet_sync_state)
                                 except StaleElementReferenceException:
+                                    seen_tids_pa.discard(tid)
                                     print(f"[{TYPE_B_LABEL}/{prptdvsn_label}][tid={tid}] 페이지 요소 참조가 "
                                           f"끊겨 이 물건을 건너뜁니다.")
                                     page_stale_count += 1
                                     continue
                                 except Exception as e:
+                                    seen_tids_pa.discard(tid)
                                     print(f"[{TYPE_B_LABEL}/{prptdvsn_label}][tid={tid}] 이 물건 처리 중 오류가 발생해 건너뜁니다: {e}")
                                     continue
 
@@ -2549,7 +2580,7 @@ def main():
                     pa_scan_complete = True
 
             if pa_expected_total <= 0 or pa_count_missing or \
-                    len(scanned_case_numbers_pa) >= pa_expected_total:
+                    len(seen_tids_pa) >= pa_expected_total:
                 break
             if pa_recollect_attempt >= MAX_RECOLLECT_ATTEMPTS:
                 print(f"[검증] ⚠️ {TYPE_B_LABEL} 재시도 한도({MAX_RECOLLECT_ATTEMPTS}회)에 도달해 "
