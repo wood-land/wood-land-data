@@ -191,6 +191,8 @@ def append_row_with_format(sheet, row_values, ac_value=None, dedupe=True):
     기존 시트 내용을 그대로 옮겨 담을 때는 dedupe=False로 호출한다(키만 등록됨)."""
     key = _row_dup_key(row_values)
     if dedupe and key in _WRITTEN_ROW_KEYS:
+        stat_inc("dup_blocked")
+        record_issue("A" if key[0] == TYPE_A_LABEL else "B", key[0], key[2], key[1], "중복차단", key[3][:60])
         return None
     _WRITTEN_ROW_KEYS.add(key)
     sheet.append(row_values)
@@ -618,6 +620,16 @@ def ensure_run_log_tab(sh):
     return ws
 
 
+# (2026-10-04) 진단 컬럼. 기존 10개 컬럼 오른쪽에 이름으로 찾아 붙인다(기존 컬럼은 건드리지 않음 -
+# 이 탭은 로컬 스크립트도 같이 쓰고 헤더 표기가 이미 다를 수 있어, 앞 10칸은 위치 기준 그대로 둔다).
+# 종류 명칭(Secrets)은 코드에 쓰지 않으므로 A=type_a(TYPE_A_LABEL), B=type_b(TYPE_B_LABEL)로 표기한다.
+RUN_LOG_EXT_HEADERS = [
+    "A_총건수_시작", "A_총건수_끝", "A_처리tid", "A_미해결tid", "A_stale건너뜀", "A_재수집회차",
+    "B_총건수_시작", "B_총건수_끝", "B_처리tid", "B_미해결tid", "B_stale건너뜀", "B_재수집회차",
+    "페이지재시도", "중복차단행", "필지추출부족", "소요시간(분)", "마감도달", "문제기록건수",
+]
+
+
 def log_run_summary(sh, summary: dict):
     """이번 실행의 요약 정보 한 줄을 실행 이력 탭에 추가한다. 이 로그 자체가
     실패해도(네트워크 오류 등) 크롤링 결과 저장에는 전혀 영향을 주지 않도록
@@ -625,13 +637,274 @@ def log_run_summary(sh, summary: dict):
     ws = ensure_run_log_tab(sh)
     if ws is None:
         return
-    row = [summary.get(h, "") for h in RUN_LOG_HEADERS]
     try:
-        ws.append_row(row, value_input_option="RAW")
+        header = ws.row_values(1)
+        base_n = len(RUN_LOG_HEADERS)
+        while len(header) < base_n:
+            header.append("")
+        added = [name for name in RUN_LOG_EXT_HEADERS if name not in header]
+        if added:
+            start_col = len(header) + 1
+            if ws.col_count < start_col + len(added):
+                ws.resize(cols=start_col + len(added) + 1)
+            ws.update(values=[added], range_name=f"{get_column_letter(start_col)}1")
+            header.extend(added)
+        row = [summary.get(h, "") for h in RUN_LOG_HEADERS]
+        for name in header[base_n:]:
+            row.append(summary.get(name, ""))
+        ws.append_row(row, value_input_option="RAW", table_range="A1")
         print(f"[실행이력] 기록 완료 - 대상탭: {summary.get('대상탭')}, "
               f"신규: {summary.get('이번실행_신규건수')}건, 검증결과: {summary.get('검증결과')}")
     except Exception as e:
         print(f"[실행이력] 기록 실패(치명적이지 않음): {e}")
+
+
+# ===================== 진단 로그 (2026-10-04) =====================
+# 문제가 생겼을 때 Actions 로그를 열어보지 않고도 원인을 알 수 있도록, 실행 중 일어난 일을
+# (1) 숫자 통계(RUN_STATS) -> _run_log 탭 오른쪽 컬럼 / Actions 요약 화면 / run_stats.json
+# (2) 문제가 된 물건 목록(RUN_ISSUES) -> _run_issues 탭
+# 으로 남긴다. 전부 "기록 실패가 크롤링을 막지 않도록" 예외를 삼킨다.
+VERBOSE_ROWS = os.environ.get("VERBOSE_ROWS", "") == "1"   # 1이면 물건마다 행 내용을 로그에 출력
+PROGRESS_EVERY = 50                 # N건 처리할 때마다 진행 한 줄 출력
+DIAG_ISSUE_LIMIT = 500              # 실행 1회당 _run_issues에 남기는 최대 건수
+DIAG_ISSUE_PER_REASON = 150         # 사유별 최대 건수(한 사유가 폭주해도 다른 사유가 밀리지 않게)
+ISSUES_TAB_NAME = "_run_issues"
+ISSUES_KEEP_ROWS = 4000             # _run_issues 탭 누적 상한(넘으면 오래된 것부터 삭제)
+ISSUES_HEADERS = ["실행시각(KST)", "대상탭", "종류(A/B)", "tid", "사건번호", "사유", "상세", "최종상태"]
+FAILURE_REASONS = ("추출실패", "stale", "예외")   # 나중에 해결됐는지 확인하는 사유
+END_TOTAL_MIN_RATIO = 0.9           # 끝 시점 총 건수가 시작의 90% 미만이면 비정상 값으로 보고 무시
+
+RUN_STATS = {}
+RUN_ISSUES = []
+FAILED_TIDS = {"A": set(), "B": set()}
+
+
+def stat_inc(key, n=1):
+    RUN_STATS[key] = RUN_STATS.get(key, 0) + n
+
+
+def record_issue(side, type_label, tid, case_no, reason, detail=""):
+    """문제가 된 물건 1건을 기록한다. 사유별/전체 상한을 넘으면 개수만 세고 목록에는 안 남긴다."""
+    stat_inc("issue_total")
+    stat_inc(f"issue_{reason}")
+    if len(RUN_ISSUES) >= DIAG_ISSUE_LIMIT or RUN_STATS[f"issue_{reason}"] > DIAG_ISSUE_PER_REASON:
+        stat_inc("issue_dropped")
+        return
+    RUN_ISSUES.append({
+        "side": side, "type": type_label, "tid": str(tid or ""), "case": str(case_no or ""),
+        "reason": reason, "detail": str(detail or "")[:150],
+    })
+
+
+def note_item_failure(side, type_label, tid, case_no, reason, detail=""):
+    """물건 1건 처리에 실패했을 때(추출실패/stale/예외) 호출한다. tid를 알면 나중에 재시도로
+    해결됐는지(최종 처리 tid 집합에 들어갔는지) 확인할 수 있게 FAILED_TIDS에 모아둔다."""
+    stat_inc(f"{side}_fail_{reason}")
+    if tid:
+        FAILED_TIDS[side].add(str(tid))
+        record_issue(side, type_label, tid, case_no, reason, detail)
+    else:
+        stat_inc(f"{side}_fail_tid불명")   # 행 요소 자체가 끊겨 tid도 못 읽은 경우(개수만 센다)
+
+
+def note_parcel_shortfall(side, type_label, tid, case_no, base_address, parcel_addrs):
+    """주소에 '외 N필지'라고 적혀 있는데 저장되는 서로 다른 필지 주소가 N+1개보다 적으면 기록한다."""
+    m = MULTI_PARCEL_PATTERN.search(base_address or "")
+    if not m:
+        return
+    expected = int(m.group(1)) + 1
+    if parcel_addrs:
+        saved = len({re.sub(r"\s+", " ", str(a or "")).strip() for a in parcel_addrs})
+    else:
+        saved = 1
+    if saved < expected:
+        stat_inc(f"{side}_parcel_short")
+        record_issue(side, type_label, tid, case_no, "필지추출부족", f"표기 {expected}필지 / 저장 {saved}행")
+
+
+def log_row(row):
+    """물건마다 행 내용을 찍던 print. 로그가 수천 줄이 되어 경고가 묻히므로 기본은 끈다."""
+    if VERBOSE_ROWS:
+        print(row)
+
+
+def progress_log(label, page_num, seen_count, expected):
+    elapsed = (time.monotonic() - _RUN_START_MONOTONIC) / 60
+    exp = f"/{expected:,}" if expected else ""
+    print(f"[진행] {label} {page_num}페이지 / 처리한 물건 {seen_count:,}{exp}건 / 경과 {elapsed:.0f}분")
+
+
+def read_end_total(driver):
+    """스캔을 마친 직후 목록 화면의 총 건수(#totalCnt)를 다시 읽는다. 읽지 못하면 None."""
+    try:
+        return get_total_count(driver, timeout=5)
+    except Exception:
+        return None
+
+
+def effective_expected(start_total, end_total, label=""):
+    """건수검증의 기준이 되는 '기대 건수'를 정한다. 크롤링은 몇 시간 걸려서 그 사이 마감/취소된
+    물건이 있으면 시작 때 읽은 총 건수보다 실제로 볼 수 있는 물건이 줄어든다. 그래서 시작/끝
+    시점 총 건수 중 작은 쪽을 기준으로 삼는다. 단, 끝 값이 시작의 90% 미만이면 화면이 이상한
+    상태에서 읽은 값으로 보고 무시한다(검증이 우연히 통과해버리는 것을 막기 위함)."""
+    if start_total is None:
+        return None
+    if end_total is None:
+        return start_total
+    if end_total < start_total * END_TOTAL_MIN_RATIO:
+        print(f"[검증] {label} 끝 시점 총 건수({end_total:,})가 시작 시점({start_total:,})보다 "
+              f"비정상적으로 작아 무시하고 시작 시점 값을 기준으로 합니다.")
+        return start_total
+    return min(start_total, end_total)
+
+
+def build_run_diag(seen_a, seen_b, a_start, a_end, b_start, b_end, a_recollect, b_recollect, deadline_hit):
+    """_run_log 오른쪽 컬럼에 들어갈 진단 값을 만든다(키는 RUN_LOG_EXT_HEADERS와 같음)."""
+    def _unresolved(side, seen):
+        return len(FAILED_TIDS[side] - seen)
+
+    def _stale(side):
+        # tid를 못 읽은 stale도 note_item_failure에서 {side}_fail_stale에 이미 포함해서 센다
+        return RUN_STATS.get(f"{side}_fail_stale", 0)
+
+    return {
+        "A_총건수_시작": a_start if a_start is not None else "",
+        "A_총건수_끝": a_end if a_end is not None else "",
+        "A_처리tid": len(seen_a),
+        "A_미해결tid": _unresolved("A", seen_a),
+        "A_stale건너뜀": _stale("A"),
+        "A_재수집회차": a_recollect,
+        "B_총건수_시작": b_start if b_start is not None else "",
+        "B_총건수_끝": b_end if b_end is not None else "",
+        "B_처리tid": len(seen_b),
+        "B_미해결tid": _unresolved("B", seen_b),
+        "B_stale건너뜀": _stale("B"),
+        "B_재수집회차": b_recollect,
+        "페이지재시도": RUN_STATS.get("page_retry", 0),
+        "중복차단행": RUN_STATS.get("dup_blocked", 0),
+        "필지추출부족": RUN_STATS.get("A_parcel_short", 0) + RUN_STATS.get("B_parcel_short", 0),
+        "소요시간(분)": round((time.monotonic() - _RUN_START_MONOTONIC) / 60, 1),
+        "마감도달": "예" if deadline_hit else "",
+        "문제기록건수": RUN_STATS.get("issue_total", 0),
+    }
+
+
+def finalize_issues(seen_a, seen_b):
+    """기록된 문제 물건마다 '최종 상태'를 붙인다: 재시도로 해결됨 / 미해결 / 참고(실패가 아닌 사유)."""
+    out = []
+    for it in RUN_ISSUES:
+        row = dict(it)
+        if it["reason"] in FAILURE_REASONS:
+            seen = seen_a if it["side"] == "A" else seen_b
+            row["final"] = "재시도로 해결됨" if it["tid"] in seen else "미해결"
+        else:
+            row["final"] = "참고"
+        out.append(row)
+    return out
+
+
+def ensure_issues_tab(sh):
+    if sh is None:
+        return None
+    try:
+        return sh.worksheet(ISSUES_TAB_NAME)
+    except gspread.exceptions.WorksheetNotFound:
+        try:
+            ws = sh.add_worksheet(title=ISSUES_TAB_NAME, rows=1000, cols=len(ISSUES_HEADERS) + 1)
+            ws.update(values=[ISSUES_HEADERS], range_name="A1")
+            print(f"[진단로그] '{ISSUES_TAB_NAME}' 탭을 새로 만들었습니다.")
+            return ws
+        except Exception as e:
+            print(f"[진단로그] '{ISSUES_TAB_NAME}' 탭 생성 실패(치명적이지 않음): {e}")
+            return None
+    except Exception as e:
+        print(f"[진단로그] '{ISSUES_TAB_NAME}' 탭을 여는 데 실패했습니다(치명적이지 않음): {e}")
+        return None
+
+
+def log_run_issues(sh, target_tab, issues):
+    """문제가 된 물건 목록을 _run_issues 탭에 누적 기록한다. 실패해도 크롤링에는 영향 없음."""
+    if sh is None or not issues:
+        return
+    ws = ensure_issues_tab(sh)
+    if ws is None:
+        return
+    try:
+        now = (datetime.utcnow() + timedelta(hours=9)).strftime("%Y-%m-%d %H:%M:%S")
+        rows = [[now, target_tab, i["side"], i["tid"], i["case"], i["reason"], i["detail"], i["final"]]
+                for i in issues]
+        existing = len(ws.col_values(1))
+        needed = existing + len(rows) + 10
+        if ws.row_count < needed:
+            ws.resize(rows=needed)
+        ws.append_rows(rows, value_input_option="RAW", table_range="A1")
+        total = existing + len(rows)           # 헤더 포함 전체 행 수
+        excess = (total - 1) - ISSUES_KEEP_ROWS
+        if excess > 0:
+            ws.delete_rows(2, 1 + excess)      # gspread: 두 번째 인자는 '끝 행 번호'(개수 아님)
+        unresolved = sum(1 for i in issues if i["final"] == "미해결")
+        print(f"[진단로그] '{ISSUES_TAB_NAME}' 탭에 문제 물건 {len(rows)}건 기록 (미해결 {unresolved}건)")
+    except Exception as e:
+        print(f"[진단로그] '{ISSUES_TAB_NAME}' 기록 실패(치명적이지 않음): {e}")
+
+
+def _mask_labels(text):
+    """공개 저장소의 Actions 요약에 종류 명칭(Secrets)이 그대로 노출되지 않게 A/B로 바꾼다."""
+    out = str(text or "")
+    for label, short in ((TYPE_A_LABEL, "A"), (TYPE_B_LABEL, "B")):
+        if label and label not in ("TYPE_A", "TYPE_B"):
+            out = out.replace(label, short)
+    return out
+
+
+def write_run_artifacts(diag, base, issues, save_dir):
+    """Actions 실행 화면 요약(GITHUB_STEP_SUMMARY)과 run_stats.json(백업 아티팩트용)을 남긴다.
+    저장소가 퍼블릭이라 요약에는 개수만 넣고, 종류 명칭은 A/B로 가린다."""
+    import json
+    try:
+        def _n(v):
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                return f"{v:,}"
+            return v if v != "" else "-"
+        lines = [
+            "## 크롤링 실행 요약", "",
+            f"- 대상 탭: `{base.get('대상탭', '')}` / 트리거: {base.get('트리거', '')} / 수집범위: {base.get('수집범위', '')}",
+            f"- 검증 결과: **{_mask_labels(base.get('검증결과', '')) or '-'}**",
+            f"- 신규 {_n(base.get('이번실행_신규건수', 0))}건 / 기존 건너뜀 {_n(base.get('이번실행_건너뛴기존건수', 0))}건"
+            f" / 소요 {_n(diag.get('소요시간(분)'))}분" + (" / ⚠️ 마감 도달" if diag.get("마감도달") else ""),
+            "", "| 항목 | A | B |", "|---|---|---|",
+            f"| 사이트 총 건수 (시작 → 끝) | {_n(diag['A_총건수_시작'])} → {_n(diag['A_총건수_끝'])}"
+            f" | {_n(diag['B_총건수_시작'])} → {_n(diag['B_총건수_끝'])} |",
+            f"| 처리한 물건(tid) | {_n(diag['A_처리tid'])} | {_n(diag['B_처리tid'])} |",
+            f"| 추출 실패 후 미해결 | {_n(diag['A_미해결tid'])} | {_n(diag['B_미해결tid'])} |",
+            f"| stale로 건너뜀 | {_n(diag['A_stale건너뜀'])} | {_n(diag['B_stale건너뜀'])} |",
+            f"| 재수집 회차 | {_n(diag['A_재수집회차'])} | {_n(diag['B_재수집회차'])} |",
+            "", f"- 페이지 재시도 {_n(diag['페이지재시도'])}회 / 중복 차단 {_n(diag['중복차단행'])}행"
+            f" / 필지추출부족 {_n(diag['필지추출부족'])}건 / 문제 기록 {_n(diag['문제기록건수'])}건"
+            f" (상세는 `{ISSUES_TAB_NAME}` 탭)",
+        ]
+        summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+        if summary_path:
+            with open(summary_path, "a", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+    except Exception as e:
+        print(f"[진단로그] 실행 요약 작성 실패(치명적이지 않음): {e}")
+    try:
+        payload = {
+            "base": {k: _mask_labels(v) if isinstance(v, str) else v for k, v in base.items()},
+            "diag": diag,
+            "counters": dict(RUN_STATS),
+            "issues": [{"종류": i["side"], "tid": i["tid"], "사건번호": i["case"], "사유": i["reason"],
+                        "상세": _mask_labels(i["detail"]), "최종상태": i["final"]} for i in issues],
+        }
+        tab = re.sub(r"[^0-9A-Za-z_]", "_", str(base.get("대상탭", "run")))
+        path = os.path.join(save_dir, f"run_stats_{tab}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=1)
+        print(f"[진단로그] 진단 통계를 저장했습니다: {path}")
+    except Exception as e:
+        print(f"[진단로그] run_stats.json 저장 실패(치명적이지 않음): {e}")
+# ==================================================================
 
 
 def count_total_runs(sh):
@@ -2265,6 +2538,16 @@ def main():
     ca_expected_total = None   # 사이트가 보여주는 type_a 검색 결과 총 건수
     pa_expected_total = 0      # type_b 자산구분 9개 카테고리 총 건수 합계
     pa_count_missing = False   # 카테고리 중 하나라도 총 건수를 못 읽었으면 True(합계 신뢰 불가)
+    # (2026-10-04) 건수검증 기준: 스캔을 마친 직후 총 건수를 다시 읽어 시작 값과 비교한다(크롤링 중
+    # 마감/취소된 물건이 있으면 시작 값보다 실제로 볼 수 있는 물건이 줄어들기 때문).
+    ca_end_total = None
+    ca_expected_effective = None
+    pa_end_total = 0
+    pa_end_missing = False
+    pa_expected_effective = 0
+    ca_recollect_attempt = 0
+    pa_recollect_attempt = 0
+    deadline_hit = False
 
     try:
         driver.get(BASE_URL)
@@ -2317,18 +2600,23 @@ def main():
                 for chk_no, row in enumerate(rows, start=1):
                     check_run_deadline()
                     tid = None
+                    cur_case = ""
                     try:
                         tid = row.get_attribute("data-tid")
                         if tid in seen_tids:
                             continue
                         seen_tids.add(tid)
+                        if len(seen_tids) % PROGRESS_EVERY == 0:
+                            progress_log(TYPE_A_LABEL, page_num, len(seen_tids), ca_expected_total)
                         data = extract_row(row, tid, chk_no=chk_no, tot_no=tot_no)
                         if not data:
                             seen_tids.discard(tid)
+                            note_item_failure("A", TYPE_A_LABEL, tid, "", "추출실패", "extract_row가 데이터를 반환하지 않음")
                             continue
                         page_extracted_count += 1
 
                         사건번호_key = (data[1] or "").strip()
+                        cur_case = 사건번호_key
                         if 사건번호_key:
                             scanned_case_numbers_ca.add(사건번호_key)
                         if 사건번호_key and 사건번호_key in existing_case_numbers:
@@ -2358,17 +2646,18 @@ def main():
                                 data[13] = "지분"
                             data[14] = base_address
 
+                        note_parcel_shortfall("A", TYPE_A_LABEL, tid, 사건번호_key, base_address, parcel_addrs)
                         total_new_count += 1
                         if len(parcel_addrs) >= 2:
                             for addr in parcel_addrs:
                                 row_data = list(data)
                                 row_data[14] = addr
-                                print(row_data)
+                                log_row(row_data)
                                 append_row_with_format(sheet, row_data, 등기요약)
                         else:
                             if parcel_addrs:
                                 data[14] = parcel_addrs[0]
-                            print(data)
+                            log_row(data)
                             append_row_with_format(sheet, data, 등기요약)
 
                         maybe_autosave(sheet, batch_ws, save_path, total_new_count, gsheet_sync_state)
@@ -2383,11 +2672,13 @@ def main():
                         # 루프(스캔 건수 부족 시 재수집)가 놓친 물건을 나중에
                         # 다시 채워준다.
                         seen_tids.discard(tid)
+                        note_item_failure("A", TYPE_A_LABEL, tid, cur_case, "stale", "")
                         print(f"[tid={tid}] 페이지 요소 참조가 끊겨 이 물건을 건너뜁니다.")
                         page_stale_count += 1
                         continue
                     except Exception as e:
                         seen_tids.discard(tid)
+                        note_item_failure("A", TYPE_A_LABEL, tid, cur_case, "예외", f"{type(e).__name__}: {e}")
                         print(f"[tid={tid}] 이 물건 처리 중 오류가 발생해 건너뜁니다: {e}")
                         continue
 
@@ -2398,6 +2689,7 @@ def main():
                 if page_extracted_count == 0 and page_stale_count >= tot_no > 0 and \
                         page_stale_retry < PAGE_STALE_RETRY_LIMIT:
                     page_stale_retry += 1
+                    stat_inc("page_retry")
                     print(f"[재시도] {page_num} 페이지의 항목이 전부 일시적 오류(stale)로 추출 실패해 "
                           f"같은 페이지를 다시 읽습니다 ({page_stale_retry}/{PAGE_STALE_RETRY_LIMIT}회차)...")
                     time.sleep(1.5)
@@ -2415,14 +2707,20 @@ def main():
                 page_num = next_page
 
             ca_scan_complete = True
-            if ca_expected_total is None or len(seen_tids) >= ca_expected_total:
+            ca_end_total = read_end_total(driver)
+            ca_expected_effective = effective_expected(ca_expected_total, ca_end_total, TYPE_A_LABEL)
+            if ca_expected_total is not None:
+                print(f"[검증] {TYPE_A_LABEL} 사이트 총 건수: 시작 {ca_expected_total:,} / 끝 "
+                      f"{format(ca_end_total, ',') if ca_end_total is not None else '확인불가'} "
+                      f"-> 비교 기준 {ca_expected_effective:,}건 (처리한 물건 {len(seen_tids):,}건)")
+            if ca_expected_total is None or len(seen_tids) >= ca_expected_effective:
                 break
             if ca_recollect_attempt >= MAX_RECOLLECT_ATTEMPTS:
                 print(f"[검증] ⚠️ {TYPE_A_LABEL} 재시도 한도({MAX_RECOLLECT_ATTEMPTS}회)에 도달해 "
                       f"더 이상 재시도하지 않고 지금까지 수집된 내용으로 진행합니다.")
                 break
             print(f"\n[검증] {TYPE_A_LABEL} 스캔 건수({len(seen_tids):,})가 사이트 총 "
-                  f"건수({ca_expected_total:,})보다 적어, 놓친 물건을 찾기 위해 목록을 처음부터 "
+                  f"건수({ca_expected_effective:,})보다 적어, 놓친 물건을 찾기 위해 목록을 처음부터 "
                   f"다시 훑습니다 ({ca_recollect_attempt}/{MAX_RECOLLECT_ATTEMPTS}회차 재시도)...")
 
         pa_recollect_attempt = 0
@@ -2430,6 +2728,9 @@ def main():
             pa_recollect_attempt += 1
             pa_expected_total = 0
             pa_count_missing = False
+            pa_end_total = 0
+            pa_end_missing = False
+            pa_expected_effective = 0
             if collect_mode == "both":
                 print(f"\n{TYPE_A_LABEL} 물건 수집 완료 (총 {sheet.max_row - 1}행). {TYPE_B_LABEL} 물건 수집을 시작합니다...")
             else:
@@ -2479,18 +2780,25 @@ def main():
                             for chk_no, row in enumerate(rows, start=1):
                                 check_run_deadline()
                                 tid = None
+                                cur_case = ""
                                 try:
                                     tid = row.get_attribute("data-tid")
                                     if tid in seen_tids_pa:
                                         continue
                                     seen_tids_pa.add(tid)
+                                    if len(seen_tids_pa) % PROGRESS_EVERY == 0:
+                                        progress_log(f"{TYPE_B_LABEL}/{prptdvsn_label}", pa_page_num,
+                                                     len(seen_tids_pa), pa_expected_total)
                                     data = extract_row_pa(row, tid, chk_no=chk_no, tot_no=tot_no)
                                     if not data:
                                         seen_tids_pa.discard(tid)
+                                        note_item_failure("B", TYPE_B_LABEL, tid, "", "추출실패",
+                                                          f"[{prptdvsn_label}] extract_row_pa가 데이터를 반환하지 않음")
                                         continue
                                     page_extracted_count += 1
 
                                     사건번호_key = (data[1] or "").strip()
+                                    cur_case = 사건번호_key
                                     if 사건번호_key:
                                         scanned_case_numbers_pa.add(사건번호_key)
                                     if 사건번호_key and 사건번호_key in existing_case_numbers:
@@ -2523,34 +2831,39 @@ def main():
                                             else:
                                                 data[3] = notes_text
 
+                                    note_parcel_shortfall("B", TYPE_B_LABEL, tid, 사건번호_key, base_address, parcel_addrs)
                                     total_new_count += 1
                                     if len(parcel_addrs) >= 2:
                                         for addr in parcel_addrs:
                                             row_data = list(data)
                                             row_data[14] = addr
-                                            print(row_data)
+                                            log_row(row_data)
                                             append_row_with_format(sheet, row_data, 등기요약)
                                     else:
                                         if parcel_addrs:
                                             data[14] = parcel_addrs[0]
-                                        print(data)
+                                        log_row(data)
                                         append_row_with_format(sheet, data, 등기요약)
 
                                     maybe_autosave(sheet, batch_ws, save_path, total_new_count, gsheet_sync_state)
                                 except StaleElementReferenceException:
                                     seen_tids_pa.discard(tid)
+                                    note_item_failure("B", TYPE_B_LABEL, tid, cur_case, "stale", f"[{prptdvsn_label}]")
                                     print(f"[{TYPE_B_LABEL}/{prptdvsn_label}][tid={tid}] 페이지 요소 참조가 "
                                           f"끊겨 이 물건을 건너뜁니다.")
                                     page_stale_count += 1
                                     continue
                                 except Exception as e:
                                     seen_tids_pa.discard(tid)
+                                    note_item_failure("B", TYPE_B_LABEL, tid, cur_case, "예외",
+                                                      f"[{prptdvsn_label}] {type(e).__name__}: {e}")
                                     print(f"[{TYPE_B_LABEL}/{prptdvsn_label}][tid={tid}] 이 물건 처리 중 오류가 발생해 건너뜁니다: {e}")
                                     continue
 
                             if page_extracted_count == 0 and page_stale_count >= tot_no > 0 and \
                                     pa_page_stale_retry < PAGE_STALE_RETRY_LIMIT:
                                 pa_page_stale_retry += 1
+                                stat_inc("page_retry")
                                 print(f"[재시도][{TYPE_B_LABEL}/{prptdvsn_label}] {pa_page_num} 페이지의 항목이 "
                                       f"전부 일시적 오류(stale)로 추출 실패해 같은 페이지를 다시 읽습니다 "
                                       f"({pa_page_stale_retry}/{PAGE_STALE_RETRY_LIMIT}회차)...")
@@ -2568,6 +2881,12 @@ def main():
                                 break
                             pa_page_num = next_page_pa
 
+                        cat_end_total = read_end_total(driver)
+                        if cat_end_total is None:
+                            pa_end_missing = True
+                        else:
+                            pa_end_total += cat_end_total
+
                     except Exception as e:
                         print(f"[{TYPE_B_LABEL}/{prptdvsn_label}] 이 카테고리 처리 중 오류가 발생해 건너뜁니다: {e}")
                         pa_all_categories_ok = False
@@ -2575,24 +2894,33 @@ def main():
                         continue
 
                 print(f"\n{TYPE_B_LABEL} 물건 수집 완료 (전체 저장된 행 {sheet.max_row - 1}행).")
+                if pa_expected_total > 0 and not pa_count_missing:
+                    pa_expected_effective = effective_expected(
+                        pa_expected_total, None if pa_end_missing else pa_end_total, TYPE_B_LABEL)
+                    print(f"[검증] {TYPE_B_LABEL} 사이트 총 건수(자산구분 합): 시작 {pa_expected_total:,} / 끝 "
+                          f"{format(pa_end_total, ',') if not pa_end_missing else '확인불가'} "
+                          f"-> 비교 기준 {pa_expected_effective:,}건 (처리한 물건 {len(seen_tids_pa):,}건)")
+                else:
+                    pa_expected_effective = pa_expected_total
 
                 if pa_all_categories_ok:
                     pa_scan_complete = True
 
             if pa_expected_total <= 0 or pa_count_missing or \
-                    len(seen_tids_pa) >= pa_expected_total:
+                    len(seen_tids_pa) >= pa_expected_effective:
                 break
             if pa_recollect_attempt >= MAX_RECOLLECT_ATTEMPTS:
                 print(f"[검증] ⚠️ {TYPE_B_LABEL} 재시도 한도({MAX_RECOLLECT_ATTEMPTS}회)에 도달해 "
                       f"더 이상 재시도하지 않고 지금까지 수집된 내용으로 진행합니다.")
                 break
             print(f"\n[검증] {TYPE_B_LABEL} 스캔 건수({len(seen_tids_pa):,})가 사이트 총 "
-                  f"건수({pa_expected_total:,})보다 적어, 놓친 물건을 찾기 위해 목록을 처음부터 "
+                  f"건수({pa_expected_effective:,})보다 적어, 놓친 물건을 찾기 위해 목록을 처음부터 "
                   f"다시 훑습니다 ({pa_recollect_attempt}/{MAX_RECOLLECT_ATTEMPTS}회차 재시도)...")
 
     except KeyboardInterrupt:
         print("사용자가 실행을 중지했습니다.")
     except RunDeadlineReached:
+        deadline_hit = True
         print(f"\n[마감] 실행 시간이 {RUN_DEADLINE_MINUTES:g}분에 도달해 수집을 여기서 멈추고, "
               f"지금까지 모은 데이터를 공유 탭에 병합합니다.")
     except StaleElementReferenceException:
@@ -2627,41 +2955,67 @@ def main():
             # (2026-10-04) 사이트 총 건수는 tid(물건) 단위다. 한 사건번호에 물건이 여러 개 걸린 경우가
             # 많아(실제 7,482건 중 사건번호 7,079개) 사건번호 개수와 비교하면 누락이 없어도 "스캔
             # 건수 부족"으로 오판해 실행이 실패 처리됐다. 그래서 처리한 tid 개수로 비교한다.
+            # 비교 기준은 시작/끝 시점 총 건수 중 작은 쪽이다(effective_expected 참고).
+            ca_expected_check = ca_expected_effective if ca_expected_effective is not None else ca_expected_total
             ca_unique_scanned = len(seen_tids)
             ca_rows_final = _count_rows_by_type(sheet, TYPE_A_LABEL)
-            print(f"\n[건수검증/{TYPE_A_LABEL}] 사이트 총 건수: {ca_expected_total:,} / "
-                  f"실제 스캔한 물건(tid) 수: {ca_unique_scanned:,} / 최종 저장된 행 수: {ca_rows_final:,}")
-            if ca_unique_scanned < ca_expected_total:
+            ca_unresolved = len(FAILED_TIDS["A"] - seen_tids)
+            print(f"\n[건수검증/{TYPE_A_LABEL}] 사이트 총 건수: 시작 {ca_expected_total:,} / 끝 "
+                  f"{format(ca_end_total, ',') if ca_end_total is not None else '확인불가'} "
+                  f"(비교 기준 {ca_expected_check:,}) / 실제 스캔한 물건(tid) 수: {ca_unique_scanned:,} / "
+                  f"최종 저장된 행 수: {ca_rows_final:,} / 추출 실패 후 미해결 tid: {ca_unresolved:,}건")
+            if ca_unique_scanned < ca_expected_check:
                 count_check_ok = False
                 count_check_notes.append(
-                    f"{TYPE_A_LABEL} 스캔 건수 부족(사이트 {ca_expected_total:,} / 실제 {ca_unique_scanned:,})"
+                    f"{TYPE_A_LABEL} 스캔 건수 부족(기준 {ca_expected_check:,} / 실제 {ca_unique_scanned:,}"
+                    f" / 추출실패 미해결 {ca_unresolved:,})"
                 )
-            if ca_rows_final < ca_expected_total:
+            if ca_rows_final < ca_expected_check:
                 count_check_ok = False
                 count_check_notes.append(
-                    f"{TYPE_A_LABEL} 저장 행수 부족(사이트 {ca_expected_total:,} / 저장 {ca_rows_final:,})"
+                    f"{TYPE_A_LABEL} 저장 행수 부족(기준 {ca_expected_check:,} / 저장 {ca_rows_final:,})"
                 )
 
         if pa_scan_complete and not pa_count_missing and pa_expected_total > 0:
+            pa_expected_check = pa_expected_effective if pa_expected_effective > 0 else pa_expected_total
             pa_unique_scanned = len(seen_tids_pa)
             pa_rows_final = _count_rows_by_type(sheet, TYPE_B_LABEL)
-            print(f"[건수검증/{TYPE_B_LABEL}] 사이트 총 건수(9개 자산구분 합): {pa_expected_total:,} / "
-                  f"실제 스캔한 물건(tid) 수: {pa_unique_scanned:,} / 최종 저장된 행 수: {pa_rows_final:,}")
-            if pa_unique_scanned < pa_expected_total:
+            pa_unresolved = len(FAILED_TIDS["B"] - seen_tids_pa)
+            print(f"[건수검증/{TYPE_B_LABEL}] 사이트 총 건수(9개 자산구분 합): 시작 {pa_expected_total:,} / 끝 "
+                  f"{format(pa_end_total, ',') if not pa_end_missing else '확인불가'} "
+                  f"(비교 기준 {pa_expected_check:,}) / 실제 스캔한 물건(tid) 수: {pa_unique_scanned:,} / "
+                  f"최종 저장된 행 수: {pa_rows_final:,} / 추출 실패 후 미해결 tid: {pa_unresolved:,}건")
+            if pa_unique_scanned < pa_expected_check:
                 count_check_ok = False
                 count_check_notes.append(
-                    f"{TYPE_B_LABEL} 스캔 건수 부족(사이트 {pa_expected_total:,} / 실제 {pa_unique_scanned:,})"
+                    f"{TYPE_B_LABEL} 스캔 건수 부족(기준 {pa_expected_check:,} / 실제 {pa_unique_scanned:,}"
+                    f" / 추출실패 미해결 {pa_unresolved:,})"
                 )
-            if pa_rows_final < pa_expected_total:
+            if pa_rows_final < pa_expected_check:
                 count_check_ok = False
                 count_check_notes.append(
-                    f"{TYPE_B_LABEL} 저장 행수 부족(사이트 {pa_expected_total:,} / 저장 {pa_rows_final:,})"
+                    f"{TYPE_B_LABEL} 저장 행수 부족(기준 {pa_expected_check:,} / 저장 {pa_rows_final:,})"
                 )
 
         if count_check_notes:
             print("[건수검증] ⚠️ 문제 발견: " + " / ".join(count_check_notes))
         elif ca_expected_total is not None or (pa_expected_total > 0 and not pa_count_missing):
             print("[건수검증] ✅ 사이트 총 건수와 비교했을 때 누락 없이 정상적으로 수집됐습니다.")
+
+        # --- 진단 통계 / 문제 물건 목록 만들기 (실패해도 크롤링 결과 저장에는 영향 없음) ---
+        run_diag = {}
+        issues_final = []
+        try:
+            _pa_ok = pa_expected_total > 0 and not pa_count_missing
+            run_diag = build_run_diag(
+                seen_tids, seen_tids_pa,
+                ca_expected_total, ca_end_total,
+                pa_expected_total if _pa_ok else None,
+                pa_end_total if (_pa_ok and not pa_end_missing) else None,
+                max(0, ca_recollect_attempt - 1), max(0, pa_recollect_attempt - 1), deadline_hit)
+            issues_final = finalize_issues(seen_tids, seen_tids_pa)
+        except Exception as e:
+            print(f"[진단로그] 진단 통계 계산 실패(치명적이지 않음): {e}")
 
         verification_result = ""  # GOOGLE_SHEETS_ENABLED가 False인 경우에도 아래에서 안전하게 참조 가능하도록 기본값 설정
         if GOOGLE_SHEETS_ENABLED and current_week_ws is not None:
@@ -2706,7 +3060,7 @@ def main():
 
             # --- 실행 이력 한 줄 기록 ---
             if google_sh is not None:
-                log_run_summary(google_sh, {
+                summary_row = {
                     "실행시각(KST)": (datetime.utcnow() + timedelta(hours=9)).strftime("%Y-%m-%d %H:%M:%S"),
                     "트리거": "schedule" if is_scheduled_run else "manual",
                     "수집범위": collect_mode,
@@ -2717,7 +3071,10 @@ def main():
                     "이번실행_건너뛴기존건수": total_skip_existing,
                     "검증결과": verification_result,
                     "비고": "" if sync_ok else "구글시트 저장 단계에서 오류 발생 - 로그 확인 필요",
-                })
+                }
+                summary_row.update(run_diag)
+                log_run_summary(google_sh, summary_row)
+                log_run_issues(google_sh, current_week_label, issues_final)
 
             if is_scheduled_run and (ca_scan_complete or pa_scan_complete) and google_sh is not None:
                 prev_week_ws = get_tab_if_exists(google_sh, prev_week_label)
@@ -2737,6 +3094,17 @@ def main():
                 cleanup_old_week_tabs(google_sh, GOOGLE_SHEET_WEEK_RETENTION)
             elif not is_scheduled_run and google_sh is not None:
                 cleanup_old_manual_tabs(google_sh, GOOGLE_SHEET_MANUAL_RETENTION)
+
+        # --- Actions 실행 화면 요약 + run_stats.json (백업 아티팩트에 포함) ---
+        if run_diag:
+            write_run_artifacts(run_diag, {
+                "대상탭": current_week_label or _manual_tab_name(date.today()),
+                "트리거": "schedule" if is_scheduled_run else "manual",
+                "수집범위": collect_mode,
+                "이번실행_신규건수": total_new_count,
+                "이번실행_건너뛴기존건수": total_skip_existing,
+                "검증결과": verification_result,
+            }, issues_final, SAVE_DIR)
 
         workbook.save(save_path)
         print(f"Excel 파일 저장 완료: {save_path} "
