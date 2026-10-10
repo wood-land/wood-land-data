@@ -986,7 +986,23 @@ def merge_orphaned_batch_tabs(sh, week_ws, week_label, max_age_hours=12):
     if not week_values or "사건번호" not in week_values[0]:
         return 0
     sano_i = week_values[0].index("사건번호")
-    known = {(r[sano_i] or "").strip() for r in week_values[1:] if sano_i < len(r)}
+    url_i = week_values[0].index("상세페이지") if "상세페이지" in week_values[0] else None
+
+    # (2026-10-10) 이미 있는 행 판별은 사건번호가 아니라 (사건번호, 물건 tid) 기준이다. 한 사건번호에
+    # 물건이 여러 개 걸린 경우가 많아, 사건번호만 보면 같은 사건번호의 나머지 물건을 빠뜨린다.
+    # 상세페이지 URL에서 tid를 못 읽는 행만 사건번호로 판단한다.
+    def _row_key(r, case_i, u_i):
+        case = (r[case_i] or "").strip() if case_i < len(r) else ""
+        tid = _tid_from_url(r[u_i]) if (u_i is not None and u_i < len(r)) else ""
+        return case, tid
+
+    known = set()
+    known_cases = set()
+    for r in week_values[1:]:
+        k = _row_key(r, sano_i, url_i)
+        if k[0]:
+            known.add(k)
+            known_cases.add(k[0])
 
     merged_tabs = 0
     for title in sorted(orphans):
@@ -996,10 +1012,14 @@ def merge_orphaned_batch_tabs(sh, week_ws, week_label, max_age_hours=12):
             if not bvalues or "사건번호" not in bvalues[0]:
                 continue
             b_sano_i = bvalues[0].index("사건번호")
+            b_url_i = bvalues[0].index("상세페이지") if "상세페이지" in bvalues[0] else None
             to_add = []
             for r in bvalues[1:]:
-                key = (r[b_sano_i] or "").strip() if b_sano_i < len(r) else ""
-                if key and key not in known:
+                case, tid = _row_key(r, b_sano_i, b_url_i)
+                if not case:
+                    continue
+                already = (case in known_cases) if not tid else ((case, tid) in known)
+                if not already:
                     to_add.append(r)
             if to_add:
                 needed_rows = len(week_values) + len(to_add) + 10
@@ -1007,7 +1027,9 @@ def merge_orphaned_batch_tabs(sh, week_ws, week_label, max_age_hours=12):
                     week_ws.resize(rows=needed_rows)
                 week_ws.append_rows(to_add, value_input_option="RAW", table_range="A1")
                 for r in to_add:
-                    known.add((r[b_sano_i] or "").strip())
+                    k = _row_key(r, b_sano_i, b_url_i)
+                    known.add(k)
+                    known_cases.add(k[0])
                 week_values.extend(to_add)
             print(f"[구글시트] 미병합 임시 탭 '{title}'의 데이터 {len(to_add)}행을 "
                   f"공유 탭 '{week_label}'에 병합했습니다.")
@@ -2509,10 +2531,33 @@ def main():
 
     for row_values, ac_value in existing_rows:
         append_row_with_format(sheet, row_values, ac_value, dedupe=False)
+
+    # (2026-10-10) 이미 저장된 물건을 건너뛰는 기준을 사건번호에서 물건(tid)으로 바꿨다. 한 사건번호에
+    # 물건이 여러 개 걸린 경우가 많아(이번 주 6,931개 tid / 6,556개 사건번호) 사건번호로 건너뛰면 마감에
+    # 걸려 일부만 저장된 뒤 이어서 돌릴 때(토요일 보충 수집) 같은 사건번호의 나머지 물건을 빠뜨린다.
+    # tid는 목록 행에서 바로 읽을 수 있어서, 이미 저장된 물건은 행 내용을 추출하기 전에 곧바로 건너뛴다
+    # (스캔 시간 단축). 기존 행에서 tid를 못 읽는 경우(상세페이지 URL 없음)만 사건번호로 판단한다.
+    existing_tids_ca, existing_tids_pa = set(), set()
+    existing_tid_case_ca, existing_tid_case_pa = {}, {}
+    existing_case_numbers_notid = set()
+    for row_values, _ac in existing_rows:
+        _t = _tid_from_url(row_values[11]) if len(row_values) > 11 else ""
+        _c = str(row_values[1] or "").strip() if len(row_values) > 1 else ""
+        if not _t:
+            if _c:
+                existing_case_numbers_notid.add(_c)
+        elif row_values[0] == TYPE_B_LABEL:
+            existing_tids_pa.add(_t)
+            existing_tid_case_pa[_t] = _c
+        else:
+            existing_tids_ca.add(_t)
+            existing_tid_case_ca[_t] = _c
+
     if existing_rows:
         기존_출처 = f"이번 주 구글 시트 탭({current_week_label})" if GOOGLE_SHEETS_ENABLED else "이전 파일"
-        print(f"{기존_출처}에서 기존 물건 {len(existing_rows)}건을 가져왔습니다 "
-              f"(사건번호 {len(existing_case_numbers)}종). 이미 있는 사건번호는 상세페이지/PDF 요청 없이 건너뜁니다.")
+        print(f"{기존_출처}에서 기존 물건 {len(existing_rows)}행을 가져왔습니다 "
+              f"(물건 {len(existing_tids_ca) + len(existing_tids_pa)}건, 사건번호 {len(existing_case_numbers)}종). "
+              f"이미 저장된 물건(tid)은 상세페이지/PDF 요청 없이 건너뜁니다.")
 
     gsheet_sync_state = {"synced_rows": 1 + len(existing_rows)}
 
@@ -2608,6 +2653,14 @@ def main():
                         seen_tids.add(tid)
                         if len(seen_tids) % PROGRESS_EVERY == 0:
                             progress_log(TYPE_A_LABEL, page_num, len(seen_tids), ca_expected_total)
+                        if tid in existing_tids_ca:
+                            # 이미 저장된 물건: 행 내용을 추출하지 않고 바로 건너뛴다(처리한 물건으로는 센다)
+                            total_skip_existing += 1
+                            page_extracted_count += 1
+                            _c = existing_tid_case_ca.get(tid, "")
+                            if _c:
+                                scanned_case_numbers_ca.add(_c)
+                            continue
                         data = extract_row(row, tid, chk_no=chk_no, tot_no=tot_no)
                         if not data:
                             seen_tids.discard(tid)
@@ -2619,7 +2672,7 @@ def main():
                         cur_case = 사건번호_key
                         if 사건번호_key:
                             scanned_case_numbers_ca.add(사건번호_key)
-                        if 사건번호_key and 사건번호_key in existing_case_numbers:
+                        if 사건번호_key and 사건번호_key in existing_case_numbers_notid:
                             total_skip_existing += 1
                             continue
 
@@ -2789,6 +2842,13 @@ def main():
                                     if len(seen_tids_pa) % PROGRESS_EVERY == 0:
                                         progress_log(f"{TYPE_B_LABEL}/{prptdvsn_label}", pa_page_num,
                                                      len(seen_tids_pa), pa_expected_total)
+                                    if tid in existing_tids_pa:
+                                        total_skip_existing += 1
+                                        page_extracted_count += 1
+                                        _c = existing_tid_case_pa.get(tid, "")
+                                        if _c:
+                                            scanned_case_numbers_pa.add(_c)
+                                        continue
                                     data = extract_row_pa(row, tid, chk_no=chk_no, tot_no=tot_no)
                                     if not data:
                                         seen_tids_pa.discard(tid)
@@ -2801,7 +2861,7 @@ def main():
                                     cur_case = 사건번호_key
                                     if 사건번호_key:
                                         scanned_case_numbers_pa.add(사건번호_key)
-                                    if 사건번호_key and 사건번호_key in existing_case_numbers:
+                                    if 사건번호_key and 사건번호_key in existing_case_numbers_notid:
                                         total_skip_existing += 1
                                         continue
 
@@ -3002,6 +3062,22 @@ def main():
         elif ca_expected_total is not None or (pa_expected_total > 0 and not pa_count_missing):
             print("[건수검증] ✅ 사이트 총 건수와 비교했을 때 누락 없이 정상적으로 수집됐습니다.")
 
+        # --- 수집 미완료 판정 (2026-10-10) ---
+        # 마감 시각 도달/예외/중단으로 스캔이 끝까지 가지 못하면 위 건수검증은 "비교 대상이 아님"으로
+        # 건너뛴다. 그러면 일부만 수집됐는데도 검증결과가 OK로 남아(실제: 경매 7,647건 중 6,931건)
+        # 실행이 성공으로 표시되던 문제가 있었다. 미완료는 검증결과에 명시하고 실패로 표시한다.
+        incomplete_notes = []
+        if collect_mode in ("type_a", "both") and not ca_scan_complete:
+            incomplete_notes.append(
+                f"{TYPE_A_LABEL} 수집 미완료(처리 {len(seen_tids):,}"
+                + (f" / 시작 {ca_expected_total:,}" if ca_expected_total else "") + ")")
+        if collect_mode in ("type_b", "both") and not pa_scan_complete:
+            incomplete_notes.append(
+                f"{TYPE_B_LABEL} 수집 미완료(처리 {len(seen_tids_pa):,}"
+                + (f" / 시작 {pa_expected_total:,}" if pa_expected_total > 0 else "") + ")")
+        if incomplete_notes and deadline_hit:
+            incomplete_notes.insert(0, f"마감 {RUN_DEADLINE_MINUTES:g}분 도달")
+
         # --- 진단 통계 / 문제 물건 목록 만들기 (실패해도 크롤링 결과 저장에는 영향 없음) ---
         run_diag = {}
         issues_final = []
@@ -3037,6 +3113,8 @@ def main():
 
             if not count_check_ok:
                 verification_result += " / 건수검증실패: " + "; ".join(count_check_notes)
+            if incomplete_notes:
+                verification_result += " / 미완료: " + "; ".join(incomplete_notes)
 
             # --- 임시 배치 탭 정리 ---
             # 최종 병합이 "OK"(예상한 그대로 정확히 반영됨)일 때만 이번 실행의
